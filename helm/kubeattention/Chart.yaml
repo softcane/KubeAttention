@@ -1,0 +1,15 @@
+apiVersion: v2
+name: kubeattention
+description: AI-Powered Kubernetes Scheduler with Attention-Based Node Scoring
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - kubernetes
+  - scheduler
+  - ai
+  - transformer
+  - ebpf
+maintainers:
+  - name: KubeAttention Team
+    email: kubeattention@example.com

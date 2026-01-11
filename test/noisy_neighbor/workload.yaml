@@ -1,0 +1,67 @@
+# Namespace for noisy neighbor tests
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: noisy-neighbor-test
+  labels:
+    kubeattention.io/test: "true"
+---
+# Test workload - a latency-sensitive application
+# This is what we're trying to protect from noisy neighbors
+apiVersion: v1
+kind: Pod
+metadata:
+  name: latency-sensitive-app
+  namespace: noisy-neighbor-test
+  labels:
+    app: victim
+    sensitivity: high
+  annotations:
+    kubeattention.io/priority: "high"
+spec:
+  # No node selector - let KubeAttention choose the best node
+  containers:
+    - name: app
+      image: nginx:alpine
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "64Mi"
+        limits:
+          cpu: "200m"
+          memory: "128Mi"
+      ports:
+        - containerPort: 80
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 80
+        initialDelaySeconds: 5
+        periodSeconds: 5
+---
+# Multiple victim pods to test scheduling decisions
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: victim-deployment
+  namespace: noisy-neighbor-test
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: victim-replica
+  template:
+    metadata:
+      labels:
+        app: victim-replica
+        sensitivity: high
+    spec:
+      containers:
+        - name: app
+          image: nginx:alpine
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+          ports:
+            - containerPort: 80

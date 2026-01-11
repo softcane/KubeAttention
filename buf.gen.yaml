@@ -1,0 +1,21 @@
+version: v2
+plugins:
+  # Go protobuf generation
+  - remote: buf.build/protocolbuffers/go
+    out: gen/go
+    opt:
+      - paths=source_relative
+
+  # Go gRPC generation
+  - remote: buf.build/grpc/go
+    out: gen/go
+    opt:
+      - paths=source_relative
+
+  # Python protobuf generation
+  - remote: buf.build/protocolbuffers/python
+    out: gen/python
+
+  # Python gRPC generation
+  - remote: buf.build/grpc/python
+    out: gen/python

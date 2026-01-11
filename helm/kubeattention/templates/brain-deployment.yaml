@@ -1,0 +1,92 @@
+{{- if .Values.brain.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubeattention.fullname" . }}-brain
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: brain
+    {{- include "kubeattention.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.brain.replicaCount }}
+  selector:
+    matchLabels:
+      app: brain
+  template:
+    metadata:
+      labels:
+        app: brain
+        {{- include "kubeattention.labels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.brain.metrics.port }}"
+    spec:
+      serviceAccountName: {{ include "kubeattention.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: brain
+          image: "{{ .Values.brain.image.repository }}:{{ .Values.brain.image.tag }}"
+          imagePullPolicy: {{ .Values.brain.image.pullPolicy }}
+          command:
+            - python
+            - -m
+            - brain.server
+            - --socket
+            - {{ .Values.brain.udsPath }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.brain.metrics.port }}
+              protocol: TCP
+          env:
+            - name: MODEL_PATH
+              value: {{ .Values.brain.modelPath }}
+            - name: METRICS_PORT
+              value: "{{ .Values.brain.metrics.port }}"
+          resources:
+            {{- toYaml .Values.brain.resources | nindent 12 }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ .Values.brain.socketDir }}
+            - name: models
+              mountPath: /models
+            - name: training-data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import grpc; ch = grpc.insecure_channel('unix://{{ .Values.brain.udsPath }}'); print('ready')"
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import grpc; ch = grpc.insecure_channel('unix://{{ .Values.brain.udsPath }}'); print('alive')"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ include "kubeattention.fullname" . }}-models
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: {{ include "kubeattention.fullname" . }}-data
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

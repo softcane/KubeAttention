@@ -1,0 +1,60 @@
+# CPU Stress Pod - Creates a "noisy neighbor" on the CPU
+# This pod consumes CPU cycles, increasing contention for co-located pods
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-stress
+  namespace: noisy-neighbor-test
+  labels:
+    app: stress-test
+    stress-type: cpu
+spec:
+  nodeSelector:
+    kubeattention.io/test-role: cpu-stress
+  containers:
+    - name: cpu-stress
+      image: progrium/stress
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "128Mi"
+        limits:
+          cpu: "1000m"
+          memory: "256Mi"
+      args:
+        - "--cpu"
+        - "2"           # 2 CPU workers
+        - "--timeout"
+        - "300s"        # Run for 5 minutes
+  restartPolicy: Never
+---
+# Alternative: Use stress-ng for more control
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-stress-ng
+  namespace: noisy-neighbor-test
+  labels:
+    app: stress-test
+    stress-type: cpu-ng
+spec:
+  nodeSelector:
+    kubeattention.io/test-role: cpu-stress
+  containers:
+    - name: stress-ng
+      image: alexeiled/stress-ng
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "128Mi"
+        limits:
+          cpu: "2000m"
+          memory: "256Mi"
+      args:
+        - "--cpu"
+        - "4"
+        - "--cpu-method"
+        - "matrixprod"  # Matrix multiplication - cache intensive
+        - "--timeout"
+        - "300"
+  restartPolicy: Never

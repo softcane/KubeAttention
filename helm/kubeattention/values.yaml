@@ -1,0 +1,117 @@
+# KubeAttention Helm Values
+# Production configuration for AI-powered Kubernetes scheduler
+
+# Global settings
+namespace: kubeattention
+
+# Brain (Python gRPC server with Transformer model)
+brain:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: kubeattention/brain
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  udsPath: /var/run/kubeattention/brain.sock
+  socketDir: /var/run/kubeattention
+  modelPath: /models/best_model.pt
+  metrics:
+    enabled: true
+    port: 8080
+
+# Collector (K8s event watcher for training data)
+collector:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: kubeattention/collector
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  outputPath: /data/events.jsonl
+  outcomeWaitMinutes: 5
+
+# Training job configuration
+training:
+  enabled: true
+  image:
+    repository: kubeattention/brain
+    tag: latest
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  epochs: 50
+  batchSize: 32
+  learningRate: 0.0001
+  dataPath: /data/events.jsonl
+  modelOutputPath: /models
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+
+# Scheduler plugin configuration
+scheduler:
+  enabled: true
+  name: kubeattention-scheduler
+  shadowMode: true
+  brainTimeout: 50ms
+  fallbackStrategy: LeastAllocated
+
+# Persistent volume for training data
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 10Gi
+  accessMode: ReadWriteOnce
+
+# Grafana dashboard
+grafana:
+  enabled: true
+  dashboard:
+    enabled: true
+    label: grafana_dashboard
+    labelValue: "1"
+
+# Prometheus metrics
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+
+# Service account
+serviceAccount:
+  create: true
+  name: kubeattention
+  annotations: {}
+
+# Pod security
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+# Node selector for Brain pod
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity rules
+affinity: {}

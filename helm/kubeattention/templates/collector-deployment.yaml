@@ -1,0 +1,43 @@
+{{- if .Values.collector.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubeattention.fullname" . }}-collector
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: collector
+    {{- include "kubeattention.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.collector.replicaCount }}
+  selector:
+    matchLabels:
+      app: collector
+  template:
+    metadata:
+      labels:
+        app: collector
+        {{- include "kubeattention.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "kubeattention.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: collector
+          image: "{{ .Values.collector.image.repository }}:{{ .Values.collector.image.tag }}"
+          imagePullPolicy: {{ .Values.collector.image.pullPolicy }}
+          command:
+            - /collector
+            - --output
+            - {{ .Values.collector.outputPath }}
+            - --outcome-wait
+            - "{{ .Values.collector.outcomeWaitMinutes }}m"
+          resources:
+            {{- toYaml .Values.collector.resources | nindent 12 }}
+          volumeMounts:
+            - name: training-data
+              mountPath: /data
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: {{ include "kubeattention.fullname" . }}-data
+{{- end }}

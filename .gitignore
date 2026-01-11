@@ -1,0 +1,60 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+
+# Go
+bin/
+kube-attention-scheduler
+kube-attention
+*.test
+*.out
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project Specific
+*.jsonl
+checkpoints/checkpoint_*.pt
+checkpoints/final_model.pt
+test/battle_results.json
+.agent/
+.gemini/
+
+# Keep the best model by default, but ignore others
+checkpoints/*
+!checkpoints/best_model.pt
+!checkpoints/training_results.json

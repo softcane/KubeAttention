@@ -1,0 +1,52 @@
+# Kind cluster configuration for KubeAttention testing
+# Creates a 3-node cluster to demonstrate scheduling decisions
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kubeattention
+
+nodes:
+  # Control plane node
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "node-role.kubernetes.io/control-plane="
+    extraMounts:
+      # Mount for UDS communication with Brain
+      - hostPath: /tmp/kubeattention
+        containerPath: /var/run/kubeattention
+
+  # Worker node 1 - Will be made "noisy" with CPU stress
+  - role: worker
+    labels:
+      kubeattention.io/test-role: cpu-stress
+    extraMounts:
+      - hostPath: /tmp/kubeattention
+        containerPath: /var/run/kubeattention
+
+  # Worker node 2 - Will be made "noisy" with memory stress  
+  - role: worker
+    labels:
+      kubeattention.io/test-role: memory-stress
+    extraMounts:
+      - hostPath: /tmp/kubeattention
+        containerPath: /var/run/kubeattention
+
+  # Worker node 3 - Clean node for comparison
+  - role: worker
+    labels:
+      kubeattention.io/test-role: clean
+    extraMounts:
+      - hostPath: /tmp/kubeattention
+        containerPath: /var/run/kubeattention
+
+# Network configuration
+networking:
+  # Use default CNI
+  disableDefaultCNI: false
+  # Pod subnet
+  podSubnet: "10.244.0.0/16"
+  # Service subnet
+  serviceSubnet: "10.96.0.0/12"

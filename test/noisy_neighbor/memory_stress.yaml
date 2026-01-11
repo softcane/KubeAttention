@@ -1,0 +1,62 @@
+# Memory Stress Pod - Creates memory pressure and bandwidth contention
+# This pod consumes memory bandwidth, affecting co-located pods
+apiVersion: v1
+kind: Pod
+metadata:
+  name: memory-stress
+  namespace: noisy-neighbor-test
+  labels:
+    app: stress-test
+    stress-type: memory
+spec:
+  nodeSelector:
+    kubeattention.io/test-role: memory-stress
+  containers:
+    - name: memory-stress
+      image: alexeiled/stress-ng
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "512Mi"
+        limits:
+          cpu: "500m"
+          memory: "2Gi"
+      args:
+        - "--vm"
+        - "2"            # 2 memory workers
+        - "--vm-bytes"
+        - "512M"         # Each allocates 512MB
+        - "--vm-method"
+        - "all"          # Cycle through all methods
+        - "--timeout"
+        - "300"
+  restartPolicy: Never
+---
+# Memory bandwidth stress - specifically targets memory bus
+apiVersion: v1
+kind: Pod
+metadata:
+  name: memory-bandwidth-stress
+  namespace: noisy-neighbor-test
+  labels:
+    app: stress-test
+    stress-type: memory-bw
+spec:
+  nodeSelector:
+    kubeattention.io/test-role: memory-stress
+  containers:
+    - name: membw-stress
+      image: alexeiled/stress-ng
+      resources:
+        requests:
+          cpu: "200m"
+          memory: "1Gi"
+        limits:
+          cpu: "1000m"
+          memory: "4Gi"
+      args:
+        - "--stream"     # STREAM benchmark - memory bandwidth intensive
+        - "4"
+        - "--timeout"
+        - "300"
+  restartPolicy: Never

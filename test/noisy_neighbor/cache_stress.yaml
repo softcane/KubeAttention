@@ -1,0 +1,95 @@
+# L3 Cache Stress Pod - Creates cache contention (the key noisy neighbor signal)
+# This is the most important stress test - L3 cache contention directly
+# impacts co-located pods and is what KubeAttention is designed to detect
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cache-stress
+  namespace: noisy-neighbor-test
+  labels:
+    app: stress-test
+    stress-type: cache
+    kubeattention.io/critical-test: "true"
+spec:
+  nodeSelector:
+    kubeattention.io/test-role: cpu-stress  # L3 cache is shared with CPU
+  containers:
+    - name: cache-stress
+      image: alexeiled/stress-ng
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "256Mi"
+        limits:
+          cpu: "2000m"
+          memory: "1Gi"
+      args:
+        - "--cache"       # Direct cache stressor
+        - "4"             # 4 cache workers
+        - "--cache-level"
+        - "3"             # Target L3 cache specifically
+        - "--timeout"
+        - "300"
+  restartPolicy: Never
+---
+# Alternative cache stress using matrix operations
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cache-matrix-stress
+  namespace: noisy-neighbor-test
+  labels:
+    app: stress-test
+    stress-type: cache-matrix
+spec:
+  nodeSelector:
+    kubeattention.io/test-role: cpu-stress
+  containers:
+    - name: matrix-stress
+      image: alexeiled/stress-ng
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "2000m"
+          memory: "2Gi"
+      args:
+        - "--matrix"      # Matrix multiplication - very cache intensive
+        - "4"
+        - "--matrix-size"
+        - "1024"          # Large matrices to exceed L3 cache
+        - "--timeout"
+        - "300"
+  restartPolicy: Never
+---
+# Cache line thrashing - worst case for co-located pods
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cache-thrash
+  namespace: noisy-neighbor-test
+  labels:
+    app: stress-test
+    stress-type: cache-thrash
+spec:
+  containers:  # No node selector - let scheduler decide
+    - name: thrash
+      image: alexeiled/stress-ng
+      resources:
+        requests:
+          cpu: "200m"
+          memory: "256Mi"
+        limits:
+          cpu: "1000m"
+          memory: "512Mi"
+      args:
+        - "--l1cache"
+        - "2"
+        - "--cache"
+        - "2"
+        - "--cache-ways"  # Attack cache associativity
+        - "8"
+        - "--timeout"
+        - "300"
+  restartPolicy: Never

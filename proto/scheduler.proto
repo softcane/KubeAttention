@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package scheduler;
+
+option go_package = "github.com/softcane/KubeAttention/proto/scheduler";
+
+// Brain service provides inference for node scoring
+service Brain {
+  // Score evaluates a single node for a pod placement
+  rpc Score(ScoreRequest) returns (ScoreResponse) {}
+  
+  // BatchScore evaluates multiple nodes for a pod (used for efficiency)
+  rpc BatchScore(BatchScoreRequest) returns (BatchScoreResponse) {}
+  
+  // HealthCheck for circuit breaker - must respond within 10ms
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse) {}
+}
+
+// NodeTelemetry contains eBPF-collected metrics from Tetragon
+message NodeTelemetry {
+  string node_name = 1;
+  
+  // CPU metrics
+  double cpu_utilization = 2;           // 0.0-1.0
+  double cpu_throttle_rate = 3;         // Throttling events/sec
+  
+  // Memory metrics  
+  double memory_utilization = 4;        // 0.0-1.0
+  double memory_bandwidth_gbps = 5;     // GB/s
+  
+  // Cache metrics (eBPF L3 cache)
+  double l3_cache_miss_rate = 6;        // 0.0-1.0
+  double l3_cache_occupancy_mb = 7;     // MB
+  
+  // I/O metrics
+  double disk_io_wait_ms = 8;           // Avg wait time
+  double disk_iops = 9;                 // Operations/sec
+  
+  // Network metrics
+  double network_rx_packets_sec = 10;
+  double network_tx_packets_sec = 11;
+  double network_drop_rate = 12;        // 0.0-1.0
+  
+  // Timestamp for temporal attention
+  int64 timestamp_unix_ms = 13;
+}
+
+// PodRequirements describes the incoming pod's resource needs
+message PodRequirements {
+  string pod_name = 1;
+  string pod_namespace = 2;
+  
+  // Resource requests
+  int64 cpu_milli = 3;                  // Millicores requested
+  int64 memory_bytes = 4;               // Bytes requested
+  
+  // Optional: workload classification hint
+  string workload_type = 5;             // e.g., "cpu-bound", "memory-bound", "io-bound"
+  
+  // Labels that may affect scheduling
+  map<string, string> labels = 6;
+}
+
+// ScoreRequest for single node evaluation
+message ScoreRequest {
+  string pod_name = 1;
+  string pod_namespace = 2;
+  string node_name = 3;
+  map<string, double> telemetry = 4;    // Legacy: simple key-value telemetry
+  
+  // Extended fields for Transformer input
+  NodeTelemetry node_telemetry = 5;     // Structured telemetry
+  PodRequirements pod_requirements = 6; // Pod resource needs
+}
+
+message ScoreResponse {
+  int64 score = 1;                      // 0-100, higher is better
+  
+  // Explanation for debugging/shadow mode
+  string reasoning = 2;                 // Human-readable explanation
+  double confidence = 3;                // Model confidence 0.0-1.0
+}
+
+// BatchScoreRequest for evaluating multiple nodes at once
+message BatchScoreRequest {
+  PodRequirements pod_requirements = 1;
+  repeated NodeTelemetry nodes = 2;     // All candidate nodes
+}
+
+message BatchScoreResponse {
+  repeated NodeScore scores = 1;
+}
+
+message NodeScore {
+  string node_name = 1;
+  int64 score = 2;
+  string reasoning = 3;
+  double confidence = 4;
+}
+
+// HealthCheck for circuit breaker pattern
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  int64 latency_ms = 2;                 // Last inference latency
+  string model_version = 3;
+}

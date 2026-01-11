@@ -1,0 +1,105 @@
+{{- if .Values.training.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "kubeattention.fullname" . }}-training
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: training
+    {{- include "kubeattention.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.training.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: training
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: {{ include "kubeattention.serviceAccountName" . }}
+          containers:
+            - name: trainer
+              image: "{{ .Values.training.image.repository }}:{{ .Values.training.image.tag }}"
+              command:
+                - python
+                - brain/training/train.py
+                - --train-data
+                - {{ .Values.training.dataPath }}
+                - --epochs
+                - "{{ .Values.training.epochs }}"
+                - --batch-size
+                - "{{ .Values.training.batchSize }}"
+                - --lr
+                - "{{ .Values.training.learningRate }}"
+                - --output-dir
+                - {{ .Values.training.modelOutputPath }}
+              resources:
+                {{- toYaml .Values.training.resources | nindent 16 }}
+              volumeMounts:
+                - name: training-data
+                  mountPath: /data
+                - name: models
+                  mountPath: /models
+          volumes:
+            - name: training-data
+              persistentVolumeClaim:
+                claimName: {{ include "kubeattention.fullname" . }}-data
+            - name: models
+              persistentVolumeClaim:
+                claimName: {{ include "kubeattention.fullname" . }}-models
+---
+# One-time training job for initial model
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "kubeattention.fullname" . }}-initial-training
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: training
+    {{- include "kubeattention.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: training
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "kubeattention.serviceAccountName" . }}
+      containers:
+        - name: trainer
+          image: "{{ .Values.training.image.repository }}:{{ .Values.training.image.tag }}"
+          command:
+            - python
+            - brain/training/train.py
+            - --train-data
+            - {{ .Values.training.dataPath }}
+            - --epochs
+            - "10"
+            - --batch-size
+            - "{{ .Values.training.batchSize }}"
+            - --output-dir
+            - {{ .Values.training.modelOutputPath }}
+          resources:
+            {{- toYaml .Values.training.resources | nindent 12 }}
+          volumeMounts:
+            - name: training-data
+              mountPath: /data
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: training-data
+          persistentVolumeClaim:
+            claimName: {{ include "kubeattention.fullname" . }}-data
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ include "kubeattention.fullname" . }}-models
+{{- end }}
