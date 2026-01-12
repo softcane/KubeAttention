@@ -34,23 +34,38 @@ class PodContext:
     workload_type: str = "unknown"
     labels: dict[str, str] = None
     
+    # Feature names for dynamic dimension calculation
+    FEATURE_NAMES: list[str] = None  # Set after class definition
+    
+    # Workload type categories (order matters for one-hot encoding)
+    WORKLOAD_TYPES: list[str] = None  # Set after class definition
+    
     def __post_init__(self):
         if self.labels is None:
             self.labels = {}
     
     def to_feature_vector(self) -> list[float]:
         """Convert pod requirements to normalized features."""
-        # Normalize CPU (0-8000m = 0-8 cores typical)
-        cpu_norm = min(1.0, self.cpu_milli / 8000.0)
+        from .config import NORMALIZATION
         
-        # Normalize memory (0-32GB to match dataset.py training normalization)
-        mem_norm = min(1.0, self.memory_bytes / (32 * 1024 * 1024 * 1024))
+        # Normalize CPU
+        cpu_norm = min(1.0, self.cpu_milli / NORMALIZATION.MAX_CPU_MILLI)
+        
+        # Normalize memory
+        mem_norm = min(1.0, self.memory_bytes / NORMALIZATION.MAX_MEMORY_BYTES)
         
         # Workload type one-hot encoding
-        workload_types = ["cpu-bound", "memory-bound", "io-bound", "balanced", "unknown"]
-        workload_onehot = [1.0 if self.workload_type == wt else 0.0 for wt in workload_types]
+        workload_onehot = [1.0 if self.workload_type == wt else 0.0 for wt in PodContext.WORKLOAD_TYPES]
         
         return [cpu_norm, mem_norm] + workload_onehot
+
+
+# Class-level constants (set after class definition to avoid dataclass issues)
+PodContext.WORKLOAD_TYPES = ["cpu-bound", "memory-bound", "io-bound", "balanced", "unknown"]
+PodContext.FEATURE_NAMES = ["cpu_normalized", "memory_normalized"] + [f"workload_{wt}" for wt in PodContext.WORKLOAD_TYPES]
+
+# Derived constant for use in model.py
+POD_CONTEXT_DIM = len(PodContext.FEATURE_NAMES)
 
 
 @dataclass  

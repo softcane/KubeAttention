@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from brain.model import AttentionScorer, create_model
 from brain.training.dataset import SchedulingDataset, create_dataloader
+from brain.config import MODEL
 
 
 @dataclass
@@ -33,11 +34,11 @@ class TrainingConfig:
     train_data_path: str = "training_data.jsonl"
     val_data_path: Optional[str] = None
     
-    # Model
-    d_model: int = 128
-    n_layers: int = 3
-    n_heads: int = 4
-    dropout: float = 0.1
+    # Model (imported from centralized config)
+    d_model: int = MODEL.D_MODEL
+    n_layers: int = MODEL.N_LAYERS
+    n_heads: int = MODEL.N_HEADS
+    dropout: float = MODEL.DROPOUT
     
     # Training
     batch_size: int = 32
@@ -286,7 +287,7 @@ class Trainer:
     
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

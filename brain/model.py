@@ -15,8 +15,9 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 
+from .config import SCORE, INFERENCE, MODEL
 from .metrics_schema import FEATURE_DIM
-from .tensor_encoder import ClusterTensor
+from .tensor_encoder import ClusterTensor, POD_CONTEXT_DIM
 
 
 class PositionalEncoding(nn.Module):
@@ -185,11 +186,11 @@ class AttentionScorer(nn.Module):
     def __init__(
         self,
         feature_dim: int = FEATURE_DIM,
-        d_model: int = 128,
-        n_layers: int = 3,
-        n_heads: int = 4,
-        pod_context_dim: int = 7,
-        dropout: float = 0.1,
+        d_model: int = MODEL.D_MODEL,
+        n_layers: int = MODEL.N_LAYERS,
+        n_heads: int = MODEL.N_HEADS,
+        pod_context_dim: int = POD_CONTEXT_DIM,
+        dropout: float = MODEL.DROPOUT,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -291,13 +292,13 @@ class AttentionScorer(nn.Module):
         # Score prediction
         scores = self.score_head(x).squeeze(-1).squeeze(0)  # (N,)
         
-        # Scale to 0-100 range with explicit clamping (Issue 7 fix)
-        scores = torch.sigmoid(scores) * 100
-        scores = torch.clamp(scores, 0, 100)  # Explicit bounds enforcement
+        # Scale to configured range with explicit clamping
+        scores = torch.sigmoid(scores) * SCORE.MAX_SCORE
+        scores = torch.clamp(scores, SCORE.MIN_SCORE, SCORE.MAX_SCORE)
         
         # Confidence estimation
         confidences = self.confidence_head(x).squeeze(-1).squeeze(0)  # (N,)
-        confidences = torch.clamp(confidences, 0, 1)  # Explicit bounds
+        confidences = torch.clamp(confidences, SCORE.MIN_CONFIDENCE, SCORE.MAX_CONFIDENCE)
         
         return scores, confidences
     

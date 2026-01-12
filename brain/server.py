@@ -33,6 +33,8 @@ except ImportError as e:
 from .model import AttentionScorer, create_model
 from .tensor_encoder import ClusterTensorEncoder, ClusterTensor, PodContext
 from .metrics_schema import NodeMetricsSnapshot
+from .config import INFERENCE, TELEMETRY
+from .utils import create_neutral_result
 
 
 # Default UDS path
@@ -49,12 +51,9 @@ class BrainServicer:
     Handles Score, BatchScore, and HealthCheck RPCs.
     
     Safety Features:
-    - Rejects requests with stale telemetry (>10s old)
+    - Rejects requests with stale telemetry (configured via TELEMETRY.MAX_STALENESS_MS)
     - Returns neutral score on NaN/Inf input
     """
-    
-    # Maximum age of telemetry data before rejecting (10 seconds)
-    MAX_TELEMETRY_STALENESS_MS = 10_000
     
     def __init__(
         self,
@@ -78,13 +77,13 @@ class BrainServicer:
                 current_time_ms = int(time.time() * 1000)
                 telemetry_age_ms = current_time_ms - request.node_telemetry.timestamp_unix_ms
                 
-                if telemetry_age_ms > self.MAX_TELEMETRY_STALENESS_MS:
+                if telemetry_age_ms > TELEMETRY.MAX_STALENESS_MS:
                     context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                    context.set_details(f"Telemetry data is {telemetry_age_ms}ms old (max: {self.MAX_TELEMETRY_STALENESS_MS}ms)")
+                    context.set_details(f"Telemetry data is {telemetry_age_ms}ms old (max: {TELEMETRY.MAX_STALENESS_MS}ms)")
                     return scheduler_pb2.ScoreResponse(
-                        score=50,
+                        score=INFERENCE.FALLBACK_SCORE,
                         reasoning=f"STALE DATA: Telemetry {telemetry_age_ms}ms old, using neutral score",
-                        confidence=0.1,
+                        confidence=INFERENCE.FALLBACK_CONFIDENCE,
                     )
             
             # Build ClusterTensor from request
@@ -147,7 +146,7 @@ class BrainServicer:
             for node in request.nodes:
                 if node.timestamp_unix_ms > 0:
                     telemetry_age_ms = current_time_ms - node.timestamp_unix_ms
-                    if telemetry_age_ms > self.MAX_TELEMETRY_STALENESS_MS:
+                    if telemetry_age_ms > TELEMETRY.MAX_STALENESS_MS:
                         stale_nodes.append(node.node_name)
             
             if stale_nodes:
@@ -155,9 +154,9 @@ class BrainServicer:
                 scores = [
                     scheduler_pb2.NodeScore(
                         node_name=node.node_name,
-                        score=50,
-                        reasoning=f"STALE DATA: Telemetry too old, using neutral score",
-                        confidence=0.1,
+                        score=INFERENCE.FALLBACK_SCORE,
+                        reasoning="STALE DATA: Telemetry too old, using neutral score",
+                        confidence=INFERENCE.FALLBACK_CONFIDENCE,
                     )
                     for node in request.nodes
                 ]
@@ -179,14 +178,13 @@ class BrainServicer:
             
             cluster_tensor = self.encoder.encode_node_snapshots(snapshots, pod)
             
-            # SAFETY: 45ms timeout with fallback (Issue 2 fix)
-            TIMEOUT_MS = 45
+            # SAFETY: Configured timeout with fallback
             try:
                 results = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
+                    asyncio.get_running_loop().run_in_executor(
                         None, self.model.score_batch, cluster_tensor
                     ),
-                    timeout=TIMEOUT_MS / 1000.0
+                    timeout=INFERENCE.MAX_LATENCY_MS / 1000.0
                 )
             except asyncio.TimeoutError:
                 # Fallback: return neutral scores if inference takes > 45ms
@@ -195,9 +193,9 @@ class BrainServicer:
                 scores = [
                     scheduler_pb2.NodeScore(
                         node_name=node.node_name,
-                        score=50,
-                        reasoning=f"TIMEOUT: Inference exceeded {TIMEOUT_MS}ms, using neutral score",
-                        confidence=0.1,
+                        score=INFERENCE.FALLBACK_SCORE,
+                        reasoning=f"TIMEOUT: Inference exceeded {INFERENCE.MAX_LATENCY_MS}ms, using neutral score",
+                        confidence=INFERENCE.FALLBACK_CONFIDENCE,
                     )
                     for node in request.nodes
                 ]
@@ -298,8 +296,8 @@ async def serve(uds_path: str = DEV_UDS_PATH):
     """Main entry point to run the Brain server."""
     server = BrainServer(uds_path=uds_path)
     
-    # Handle shutdown signals
-    loop = asyncio.get_event_loop()
+    # Handle shutdown signals (must use get_running_loop inside async context)
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(server.stop()))
     

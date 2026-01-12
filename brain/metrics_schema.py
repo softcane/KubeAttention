@@ -69,7 +69,7 @@ TETRAGON_METRICS_SCHEMA: list[TetragonMetricSpec] = [
         category=MetricCategory.MEMORY,
         unit="GB/s",
         min_value=0.0,
-        max_value=200.0,  # Modern DDR5 can hit ~100+ GB/s
+        max_value=200.0,
         description="Memory bandwidth utilization",
         ebpf_probe="perf:mem_load_retired.l3_miss",
     ),
@@ -89,7 +89,7 @@ TETRAGON_METRICS_SCHEMA: list[TetragonMetricSpec] = [
         category=MetricCategory.CACHE,
         unit="MB",
         min_value=0.0,
-        max_value=256.0,  # Large server L3 caches
+        max_value=256.0,
         description="L3 cache occupancy in megabytes",
         ebpf_probe="perf:llc_occupancy",
     ),
@@ -109,7 +109,7 @@ TETRAGON_METRICS_SCHEMA: list[TetragonMetricSpec] = [
         category=MetricCategory.IO,
         unit="ops/sec",
         min_value=0.0,
-        max_value=1000000.0,  # NVMe can hit 1M+ IOPS
+        max_value=1000000.0,
         description="Disk I/O operations per second",
         ebpf_probe="tracepoint:block:block_rq_issue",
     ),
