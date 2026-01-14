@@ -1,0 +1,47 @@
+# Stress-Memory-Bandwidth Generator
+# Saturates memory bus to create memory bandwidth contention
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stress-membw
+  namespace: benchmark
+  labels:
+    app: stress-membw
+    role: noisy-neighbor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stress-membw
+  template:
+    metadata:
+      labels:
+        app: stress-membw
+        role: noisy-neighbor
+    spec:
+      containers:
+        - name: stress
+          image: polinux/stress-ng:latest
+          args:
+            - "--stream"
+            - "2"              # 2 memory bandwidth stressors
+            - "--stream-l3-size"
+            - "8M"             # L3 cache size target
+            - "--timeout"
+            - "0"              # Run indefinitely
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubeattention.io/profile
+                    operator: In
+                    values: ["noisy-1", "noisy-2"]

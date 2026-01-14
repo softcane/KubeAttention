@@ -43,6 +43,23 @@ message NodeTelemetry {
   
   // Timestamp for temporal attention
   int64 timestamp_unix_ms = 13;
+  
+  // Cost metrics (Phase 2)
+  double cost_per_hour = 14;            // Normalized 0.0-1.0 (cheap to expensive)
+  bool is_spot_instance = 15;           // True if Spot/Preemptible
+  
+  // Topology/Resilience metrics (Phase 4)
+  string availability_zone = 16;        // e.g., "us-east-1a"
+  string rack_id = 17;                  // Rack-level failure domain
+  double spot_interruption_risk = 18;   // 0.0-1.0 (from AWS/GCP API)
+}
+
+// Criticality level for pod placement (Phase 2)
+enum Criticality {
+  CRITICALITY_UNKNOWN = 0;    // Default, use MEDIUM behavior
+  CRITICALITY_LOW = 1;        // Batch jobs, can tolerate interruption
+  CRITICALITY_MEDIUM = 2;     // Standard services
+  CRITICALITY_HIGH = 3;       // Latency-critical, SLA-bound
 }
 
 // PodRequirements describes the incoming pod's resource needs
@@ -59,6 +76,9 @@ message PodRequirements {
   
   // Labels that may affect scheduling
   map<string, string> labels = 6;
+  
+  // Criticality level (Phase 2)
+  Criticality criticality = 7;          // From pod annotation kubeattention.io/criticality
 }
 
 // ScoreRequest for single node evaluation

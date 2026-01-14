@@ -17,7 +17,7 @@ try:
     HAS_PYARROW = True
 except ImportError:
     HAS_PYARROW = False
-    print("⚠️ PyArrow not installed. Run: pip install pyarrow")
+    print("PyArrow not installed. Run: pip install pyarrow")
 
 
 def export_to_parquet(
@@ -50,7 +50,7 @@ def export_to_parquet(
                     events.append(event)
     
     if not events:
-        print("⚠️ No completed events to export")
+        print("No completed events to export")
         return 0
     
     # Flatten nested structures for Parquet
@@ -84,7 +84,7 @@ def export_to_parquet(
     # Write to Parquet
     pq.write_table(table, parquet_path, compression='snappy')
     
-    print(f"✅ Exported {len(flattened)} events to {parquet_path}")
+    print(f"Exported {len(flattened)} events to {parquet_path}")
     return len(flattened)
 
 
@@ -123,7 +123,7 @@ def load_training_data(
         
         events.append(event)
     
-    print(f"📊 Loaded {len(events)} events from {parquet_path}")
+    print(f"Loaded {len(events)} events from {parquet_path}")
     return events
 
 
@@ -175,7 +175,7 @@ if __name__ == "__main__":
     
     if args.stats:
         stats = get_training_stats(args.input)
-        print("\n📊 Training Data Statistics:")
+        print("\nTraining Data Statistics:")
         print(f"   Total events: {stats['total_events']}")
         print(f"   Outcomes: {stats['outcomes']}")
         print(f"   Namespaces: {stats['namespaces']}")

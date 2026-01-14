@@ -254,7 +254,7 @@ func (c *EventCollector) evaluatePendingOutcomes(ctx context.Context) {
 		// Remove from pending
 		delete(c.pendingOutcomes, podUID)
 
-		fmt.Printf("✅ Outcome for %s/%s: %s\n", event.PodNamespace, event.PodName, event.Outcome)
+		fmt.Printf("Outcome for %s/%s: %s\n", event.PodNamespace, event.PodName, event.Outcome)
 	}
 }
 

@@ -1,16 +1,16 @@
 """
-KubeAttention Brain - Transformer-based Node Scoring
+KubeAttention Brain - ML-based Node Scoring
 
 This package implements the AI "Brain" for KubeAttention scheduler:
 - config: Centralized configuration constants
 - metrics_schema: eBPF Tetragon metrics definitions
 - tensor_encoder: ClusterTensor encoding from raw telemetry
-- model: PyTorch Transformer for node scoring
+- models: Scoring models (MLP, XGBoost)
 - server: gRPC server over Unix Domain Socket
 - utils: Shared utility functions
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # Configuration
@@ -18,10 +18,12 @@ __all__ = [
     "TELEMETRY", 
     "SCORE",
     "NORMALIZATION",
-    "MODEL",
+    "MODEL_SELECTION",
     # Core classes
-    "AttentionScorer",
-    "create_model",
+    "get_model",
+    "BaseScorer",
+    "MLPScorer",
+    "XGBoostScorer",
     "ClusterTensorEncoder",
     "ClusterTensor",
     "PodContext",
@@ -35,15 +37,21 @@ __all__ = [
 
 # Lazy imports to avoid circular dependencies
 def __getattr__(name):
-    if name in ("INFERENCE", "TELEMETRY", "SCORE", "NORMALIZATION", "MODEL"):
+    if name in ("INFERENCE", "TELEMETRY", "SCORE", "NORMALIZATION", "MODEL_SELECTION"):
         from . import config
         return getattr(config, name)
-    elif name == "AttentionScorer":
-        from .model import AttentionScorer
-        return AttentionScorer
-    elif name == "create_model":
-        from .model import create_model
-        return create_model
+    elif name == "get_model":
+        from .models import get_model
+        return get_model
+    elif name == "BaseScorer":
+        from .models.base import BaseScorer
+        return BaseScorer
+    elif name == "MLPScorer":
+        from .models.mlp_scorer import MLPScorer
+        return MLPScorer
+    elif name == "XGBoostScorer":
+        from .models.xgboost_scorer import XGBoostScorer
+        return XGBoostScorer
     elif name in ("ClusterTensorEncoder", "ClusterTensor", "PodContext"):
         from . import tensor_encoder
         return getattr(tensor_encoder, name)

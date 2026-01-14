@@ -1,0 +1,115 @@
+# KubeAttention Brain Service Deployment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubeattention-system
+  labels:
+    app.kubernetes.io/name: kubeattention
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeattention-brain
+  namespace: kubeattention-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeattention-brain-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeattention-brain-binding
+subjects:
+  - kind: ServiceAccount
+    name: kubeattention-brain
+    namespace: kubeattention-system
+roleRef:
+  kind: ClusterRole
+  name: kubeattention-brain-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeattention-brain
+  namespace: kubeattention-system
+  labels:
+    app: kubeattention-brain
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubeattention-brain
+  template:
+    metadata:
+      labels:
+        app: kubeattention-brain
+    spec:
+      serviceAccountName: kubeattention-brain
+      # Run on control-plane node for low latency to scheduler
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      containers:
+        - name: brain
+          image: kubeattention-brain:latest
+          imagePullPolicy: Never  # Use local image from Kind
+          ports:
+            - containerPort: 50051
+              name: grpc
+            - containerPort: 9090
+              name: metrics
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/run/kubeattention
+          # Simple startup probe instead of gRPC probe to avoid early failures
+          startupProbe:
+            exec:
+              command: ["python", "-c", "print('ok')"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import socket; s=socket.socket(); s.connect(('localhost',50051)); s.close()"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import socket; s=socket.socket(); s.connect(('localhost',50051)); s.close()"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeattention-brain
+  namespace: kubeattention-system
+spec:
+  selector:
+    app: kubeattention-brain
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+    - name: metrics
+      port: 9090
+      targetPort: 9090

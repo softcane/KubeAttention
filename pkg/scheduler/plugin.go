@@ -337,7 +337,7 @@ func (ka *KubeAttention) PostBind(
 				pod.Namespace, pod.Name, nodeName, rec.BestNode, rec.Score, rec.Confidence)
 
 			if rec.BestNode != nodeName {
-				fmt.Printf("  ⚠️ Decision differed! Reason: %s\n", rec.Reasoning)
+				fmt.Printf("  Decision differed! Reason: %s\n", rec.Reasoning)
 			}
 		}
 	}

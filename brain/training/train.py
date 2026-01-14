@@ -1,8 +1,7 @@
 """
-Training script for KubeAttention AttentionScorer model.
+Training script for KubeAttention MLP/XGBoost models.
 
-Trains the Transformer model on scheduling events with outcomes,
-using cross-entropy loss to predict which node leads to the best outcome.
+Trains the scorer model on scheduling events with outcomes.
 """
 
 import os
@@ -12,19 +11,14 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, asdict
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import numpy as np
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from brain.model import AttentionScorer, create_model
+from brain.models import get_model, list_models
 from brain.training.dataset import SchedulingDataset, create_dataloader
-from brain.config import MODEL
+from brain.config import MODEL_SELECTION
 
 
 @dataclass
@@ -34,324 +28,145 @@ class TrainingConfig:
     train_data_path: str = "training_data.jsonl"
     val_data_path: Optional[str] = None
     
-    # Model (imported from centralized config)
-    d_model: int = MODEL.D_MODEL
-    n_layers: int = MODEL.N_LAYERS
-    n_heads: int = MODEL.N_HEADS
-    dropout: float = MODEL.DROPOUT
+    # Model selection: "mlp" or "xgboost"
+    model_type: str = MODEL_SELECTION.MODEL_TYPE
     
-    # Training
+    # MLP-specific
+    hidden_dim: int = 64
+    epochs: int = 50
+    learning_rate: float = 1e-3
     batch_size: int = 32
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.01
-    num_epochs: int = 50
-    warmup_epochs: int = 5
+    
+    # XGBoost-specific
+    n_estimators: int = 100
+    max_depth: int = 6
     
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
-    save_every_epochs: int = 5
-    
-    # Device
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-class Trainer:
-    """
-    Trainer for the AttentionScorer model.
+def prepare_training_data(data_path: str) -> tuple:
+    """Load and prepare training data from JSONL."""
+    from brain.metrics_schema import FEATURE_NAMES
     
-    Uses weighted cross-entropy loss where:
-    - OOM/eviction outcomes have higher weight (penalize bad placements more)
-    - Success outcomes train the model to prefer those nodes
-    """
+    dataset = SchedulingDataset(data_path)
     
-    def __init__(self, config: TrainingConfig):
-        self.config = config
-        self.device = torch.device(config.device)
-        
-        # Create checkpoint directory
-        os.makedirs(config.checkpoint_dir, exist_ok=True)
-        
-        # Initialize model
-        self.model = AttentionScorer(
-            d_model=config.d_model,
-            n_layers=config.n_layers,
-            n_heads=config.n_heads,
-            dropout=config.dropout,
-        ).to(self.device)
-        
-        # Count parameters
-        num_params = sum(p.numel() for p in self.model.parameters())
-        print(f"🧠 Model initialized with {num_params:,} parameters")
-        
-        # Optimizer
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
-        
-        # Learning rate scheduler
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=config.num_epochs - config.warmup_epochs,
-        )
-        
-        # NOTE: We use MSE loss directly in train_epoch/validate, not a stored loss_fn
-        # This is because we're training for regression (score prediction) not classification
-        # The per-sample loss is computed as: F.mse_loss(scores / 100.0, target)
-        
-        # Training state
-        self.current_epoch = 0
-        self.best_val_loss = float('inf')
-        self.train_losses = []
-        self.val_losses = []
+    X_list = []
+    y_list = []
+    w_list = []
     
-    def train_epoch(self, dataloader: DataLoader) -> float:
-        """Train for one epoch."""
-        self.model.train()
-        total_loss = 0.0
-        num_batches = 0
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        num_nodes = sample["num_nodes"].item()
         
-        for batch in dataloader:
-            # Move to device
-            node_features = batch["node_features"].to(self.device)
-            pod_context = batch["pod_context"].to(self.device)
-            labels = batch["labels"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            weights = batch["weight"].to(self.device)
-            
-            # Forward pass - need to construct ClusterTensor
-            # For now, use a simplified forward
-            batch_size = node_features.shape[0]
-            
-            # Reshape for model: (B, N, T, F) -> process each sample
-            losses = []
-            for i in range(batch_size):
-                # Create ClusterTensor-like structure
-                from brain.tensor_encoder import ClusterTensor
-                
-                num_nodes = batch["num_nodes"][i].item()
-                seq_len = node_features.shape[2]  # T dimension
-                
-                cluster_tensor = ClusterTensor(
-                    node_features=node_features[i, :num_nodes],  # (N, T, F)
-                    pod_context=pod_context[i],  # (P,)
-                    attention_mask=attention_mask[i, :num_nodes],  # (N,)
-                    node_names=[f"node-{j}" for j in range(num_nodes)],
-                    timestamps=torch.arange(seq_len, dtype=torch.float32),  # (T,)
-                )
-                
-                scores, confidences = self.model(cluster_tensor)
-                
-                # Compute loss for this sample
-                # Target: node that was chosen and led to good outcome
-                target = labels[i, :num_nodes]
-                
-                # Use MSE loss: predict the outcome score for each node
-                sample_loss = F.mse_loss(scores / 100.0, target)
-                losses.append(sample_loss * weights[i])
-            
-            # Average loss across batch
-            loss = torch.stack(losses).mean()
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            
-            total_loss += loss.item()
-            num_batches += 1
+        # Node features: use last timestep
+        node_feats = sample["node_features"][:num_nodes, -1, :].numpy()  # (N, F)
         
-        return total_loss / max(num_batches, 1)
+        # Pod context features: broadcast to all nodes
+        pod_ctx = sample["pod_context"].numpy()  # (P,)
+        pod_broadcast = np.tile(pod_ctx, (num_nodes, 1))  # (N, P)
+        
+        # Concatenate node features with pod context for full input
+        combined_feats = np.hstack([node_feats, pod_broadcast])  # (N, F+P)
+        
+        labels = sample["labels"][:num_nodes].numpy()
+        weight = sample["weight"].item()
+        
+        X_list.append(combined_feats)
+        y_list.append(labels)
+        w_list.extend([weight] * num_nodes)
     
-    @torch.no_grad()
-    def validate(self, dataloader: DataLoader) -> float:
-        """Validate the model."""
-        self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
-        
-        for batch in dataloader:
-            node_features = batch["node_features"].to(self.device)
-            pod_context = batch["pod_context"].to(self.device)
-            labels = batch["labels"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            
-            batch_size = node_features.shape[0]
-            
-            losses = []
-            for i in range(batch_size):
-                from brain.tensor_encoder import ClusterTensor
-                
-                num_nodes = batch["num_nodes"][i].item()
-                seq_len = node_features.shape[2]
-                
-                cluster_tensor = ClusterTensor(
-                    node_features=node_features[i, :num_nodes],
-                    pod_context=pod_context[i],
-                    attention_mask=attention_mask[i, :num_nodes],
-                    node_names=[f"node-{j}" for j in range(num_nodes)],
-                    timestamps=torch.arange(seq_len, dtype=torch.float32),
-                )
-                
-                scores, _ = self.model(cluster_tensor)
-                target = labels[i, :num_nodes]
-                sample_loss = F.mse_loss(scores / 100.0, target)
-                losses.append(sample_loss)
-            
-            loss = torch.stack(losses).mean()
-            total_loss += loss.item()
-            num_batches += 1
-        
-        return total_loss / max(num_batches, 1)
+    X = np.vstack(X_list)
+    y = np.concatenate(y_list)
+    w = np.array(w_list)
     
-    def train(
-        self,
-        train_dataloader: DataLoader,
-        val_dataloader: Optional[DataLoader] = None,
-    ) -> Dict[str, Any]:
-        """Full training loop."""
-        print(f"🚀 Starting training for {self.config.num_epochs} epochs")
-        print(f"   Device: {self.device}")
-        print(f"   Batch size: {self.config.batch_size}")
-        print(f"   Learning rate: {self.config.learning_rate}")
-        print()
-        
-        start_time = time.time()
-        
-        for epoch in range(self.config.num_epochs):
-            self.current_epoch = epoch + 1
-            
-            # Train
-            train_loss = self.train_epoch(train_dataloader)
-            self.train_losses.append(train_loss)
-            
-            # Validate
-            val_loss = None
-            if val_dataloader is not None:
-                val_loss = self.validate(val_dataloader)
-                self.val_losses.append(val_loss)
-                
-                # Track best model
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self.save_checkpoint("best_model.pt")
-            
-            # Update learning rate
-            if epoch >= self.config.warmup_epochs:
-                self.scheduler.step()
-            
-            # Log progress
-            lr = self.optimizer.param_groups[0]['lr']
-            log_msg = f"Epoch {epoch+1}/{self.config.num_epochs} | Train Loss: {train_loss:.4f}"
-            if val_loss is not None:
-                log_msg += f" | Val Loss: {val_loss:.4f}"
-            log_msg += f" | LR: {lr:.2e}"
-            print(log_msg)
-            
-            # Save checkpoint periodically
-            if (epoch + 1) % self.config.save_every_epochs == 0:
-                self.save_checkpoint(f"checkpoint_epoch_{epoch+1}.pt")
-        
-        elapsed = time.time() - start_time
-        print(f"\n✅ Training complete in {elapsed/60:.1f} minutes")
-        
-        # Save final model
-        self.save_checkpoint("final_model.pt")
-        
-        return {
-            "train_losses": self.train_losses,
-            "val_losses": self.val_losses,
-            "best_val_loss": self.best_val_loss,
-            "elapsed_seconds": elapsed,
-        }
-    
-    def save_checkpoint(self, filename: str):
-        """Save model checkpoint."""
-        path = Path(self.config.checkpoint_dir) / filename
-        
-        checkpoint = {
-            "epoch": self.current_epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "config": asdict(self.config),
-            "train_losses": self.train_losses,
-            "val_losses": self.val_losses,
-            "best_val_loss": self.best_val_loss,
-        }
-        
-        torch.save(checkpoint, path)
-        print(f"💾 Saved checkpoint to {path}")
-    
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        self.current_epoch = checkpoint["epoch"]
-        self.train_losses = checkpoint.get("train_losses", [])
-        self.val_losses = checkpoint.get("val_losses", [])
-        self.best_val_loss = checkpoint.get("best_val_loss", float('inf'))
-        
-        print(f"📂 Loaded checkpoint from {path} (epoch {self.current_epoch})")
+    return X, y, w
+
 
 
 def train_model(
     train_data_path: str,
     val_data_path: Optional[str] = None,
     output_dir: str = "checkpoints",
-    num_epochs: int = 50,
-    batch_size: int = 32,
-    learning_rate: float = 1e-4,
+    model_type: str = "mlp",
+    **kwargs,
 ) -> str:
     """
     High-level function to train a model.
     
-    Returns path to the best model checkpoint.
+    Args:
+        train_data_path: Path to training JSONL data
+        val_data_path: Optional path to validation data
+        output_dir: Output directory for checkpoints
+        model_type: "mlp" or "xgboost"
+        **kwargs: Model-specific parameters
+        
+    Returns:
+        Path to the saved model checkpoint
     """
-    config = TrainingConfig(
-        train_data_path=train_data_path,
-        val_data_path=val_data_path,
-        checkpoint_dir=output_dir,
-        num_epochs=num_epochs,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-    )
+    print(f"Training {model_type.upper()} model...")
+    print(f"  Data: {train_data_path}")
     
-    # Create dataloaders
-    train_dataloader = create_dataloader(
-        train_data_path,
-        batch_size=batch_size,
-        shuffle=True,
-    )
+    os.makedirs(output_dir, exist_ok=True)
     
-    val_dataloader = None
+    # Prepare data
+    print("Loading training data...")
+    X_train, y_train, w_train = prepare_training_data(train_data_path)
+    print(f"  Samples: {len(X_train):,}")
+    print(f"  Features: {X_train.shape[1]}")
+    
+    X_val, y_val = None, None
     if val_data_path:
-        val_dataloader = create_dataloader(
-            val_data_path,
-            batch_size=batch_size,
-            shuffle=False,
-        )
+        X_val, y_val, _ = prepare_training_data(val_data_path)
+        print(f"  Validation samples: {len(X_val):,}")
+    
+    # Initialize model with correct input dimension
+    input_dim = X_train.shape[1]
+    if model_type == "mlp":
+        model = get_model(model_type, input_dim=input_dim, **kwargs)
+    else:
+        model = get_model(model_type, **kwargs)
+    print(f"  Model: {model.name}")
+    print(f"  Parameters: {model.num_parameters:,}")
+    print(f"  Input dim: {input_dim}")
+
     
     # Train
-    trainer = Trainer(config)
-    results = trainer.train(train_dataloader, val_dataloader)
+    start_time = time.perf_counter()
+    
+    if model_type == "mlp":
+        metrics = model.train(
+            X_train, y_train,
+            weights=w_train,
+            epochs=kwargs.get("epochs", 50),
+            lr=kwargs.get("learning_rate", 1e-3),
+            batch_size=kwargs.get("batch_size", 32),
+        )
+    else:
+        eval_set = (X_val, y_val) if X_val is not None else None
+        metrics = model.train(X_train, y_train, weights=w_train, eval_set=eval_set)
+    
+    elapsed = time.perf_counter() - start_time
+    print(f"Training complete in {elapsed:.1f}s")
+    
+    # Save model
+    model_ext = ".pt" if model_type == "mlp" else ".json"
+    model_path = os.path.join(output_dir, f"best_model{model_ext}")
+    model.save(model_path)
+    print(f"Model saved to: {model_path}")
     
     # Save training results
-    results_path = Path(output_dir) / "training_results.json"
+    results = {
+        "model_type": model_type,
+        "num_samples": len(X_train),
+        "elapsed_seconds": elapsed,
+        **metrics,
+    }
+    results_path = os.path.join(output_dir, "training_results.json")
     with open(results_path, 'w') as f:
-        json.dump({
-            "train_losses": results["train_losses"],
-            "val_losses": results["val_losses"],
-            "best_val_loss": results["best_val_loss"],
-            "elapsed_seconds": results["elapsed_seconds"],
-        }, f, indent=2)
+        json.dump(results, f, indent=2)
     
-    return str(Path(output_dir) / "best_model.pt")
+    return model_path
 
 
 if __name__ == "__main__":
@@ -361,9 +176,13 @@ if __name__ == "__main__":
     parser.add_argument("--train-data", required=True, help="Path to training data")
     parser.add_argument("--val-data", help="Path to validation data")
     parser.add_argument("--output-dir", default="checkpoints", help="Output directory")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--model", default="mlp", choices=["mlp", "xgboost"],
+                        help="Model type (default: mlp)")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs (MLP)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (MLP)")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size (MLP)")
+    parser.add_argument("--n-estimators", type=int, default=100, help="Trees (XGBoost)")
+    parser.add_argument("--max-depth", type=int, default=6, help="Max depth (XGBoost)")
     
     args = parser.parse_args()
     
@@ -371,9 +190,12 @@ if __name__ == "__main__":
         train_data_path=args.train_data,
         val_data_path=args.val_data,
         output_dir=args.output_dir,
-        num_epochs=args.epochs,
-        batch_size=args.batch_size,
+        model_type=args.model,
+        epochs=args.epochs,
         learning_rate=args.lr,
+        batch_size=args.batch_size,
+        n_estimators=args.n_estimators,
+        max_depth=args.max_depth,
     )
     
-    print(f"\n🎉 Best model saved to: {best_model_path}")
+    print(f"\nBest model saved to: {best_model_path}")

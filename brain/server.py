@@ -30,10 +30,11 @@ except ImportError as e:
         f"Error: {e}"
     )
 
-from .model import AttentionScorer, create_model
+from .models import get_model
+from .models.base import BaseScorer
 from .tensor_encoder import ClusterTensorEncoder, ClusterTensor, PodContext
 from .metrics_schema import NodeMetricsSnapshot
-from .config import INFERENCE, TELEMETRY
+from .config import INFERENCE, TELEMETRY, MODEL_SELECTION
 from .utils import create_neutral_result
 
 
@@ -57,15 +58,19 @@ class BrainServicer:
     
     def __init__(
         self,
-        model: Optional[AttentionScorer] = None,
+        model: Optional[BaseScorer] = None,
         encoder: Optional[ClusterTensorEncoder] = None,
-        model_version: str = "v0.1.0",
+        model_version: str = "v0.2.0",
     ):
-        self.model = model or create_model()
+        self.model = model or get_model(MODEL_SELECTION.MODEL_TYPE)
         self.encoder = encoder or ClusterTensorEncoder()
         self.model_version = model_version
         self.last_latency_ms = 0
         self._request_count = 0
+        
+        # Cache for proactive rebalancing (Phase 4)
+        # node_name -> NodeMetricsSnapshot
+        self.last_telemetry_cache = {}
     
     async def Score(self, request, context):
         """Handle single node score request."""
@@ -86,60 +91,61 @@ class BrainServicer:
                         confidence=INFERENCE.FALLBACK_CONFIDENCE,
                     )
             
-            # Build ClusterTensor from request
+            # Extract node snapshot
             if request.node_telemetry.node_name:
-                # Use structured telemetry
                 snapshot = NodeMetricsSnapshot.from_proto(request.node_telemetry)
-                pod = PodContext(
-                    pod_name=request.pod_requirements.pod_name or request.pod_name,
-                    pod_namespace=request.pod_requirements.pod_namespace or request.pod_namespace,
-                    cpu_milli=request.pod_requirements.cpu_milli,
-                    memory_bytes=request.pod_requirements.memory_bytes,
-                    workload_type=request.pod_requirements.workload_type or "unknown",
-                )
-                cluster_tensor = self.encoder.encode_node_snapshots(
-                    [[snapshot]], pod
-                )
             else:
-                # Legacy: simple telemetry map
                 snapshot = NodeMetricsSnapshot(
                     node_name=request.node_name,
                     cpu_utilization=request.telemetry.get("cpu_utilization", 0.5),
                     memory_utilization=request.telemetry.get("memory_utilization", 0.5),
                 )
-                pod = PodContext(
-                    pod_name=request.pod_name,
-                    pod_namespace=request.pod_namespace,
-                    cpu_milli=1000,
-                    memory_bytes=1024 * 1024 * 512,
-                )
-                cluster_tensor = self.encoder.encode_node_snapshots(
-                    [[snapshot]], pod
-                )
             
-            # Run model inference
-            results = self.model.score_batch(cluster_tensor)
+            # Convert snapshot to numpy feature array
+            from .metrics_schema import FEATURE_NAMES
+            import numpy as np
+            
+            node_features = []
+            for feat_name in FEATURE_NAMES:
+                val = getattr(snapshot, feat_name, 0.0)
+                node_features.append(float(val) if val is not None else 0.0)
+            node_features = np.array([node_features], dtype=np.float32)
+            
+            # Build pod context features
+            pod_cpu_norm = min(request.pod_requirements.cpu_milli / 4000.0, 1.0) if hasattr(request, 'pod_requirements') else 0.25
+            pod_mem_norm = min(request.pod_requirements.memory_bytes / (16 * 1024**3), 1.0) if hasattr(request, 'pod_requirements') else 0.25
+            pod_features = np.array([pod_cpu_norm, pod_mem_norm, 0.5, 0.5, 0.5], dtype=np.float32)
+            
+            # Run model inference using new score_nodes interface
+            results = self.model.score_nodes(node_features, pod_features, [snapshot.node_name])
             result = results[0]
             
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self.last_latency_ms = int(elapsed_ms)
             
+            # Update cache for proactive rebalancing
+            self.last_telemetry_cache[snapshot.node_name] = snapshot
+            
             return scheduler_pb2.ScoreResponse(
-                score=result["score"],
-                reasoning=result["reasoning"],
-                confidence=result["confidence"],
+                score=result.score,
+                reasoning=result.reasoning,
+                confidence=result.confidence,
             )
             
         except Exception as e:
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return scheduler_pb2.ScoreResponse(score=50, reasoning=f"Error: {e}")
+
     
     async def BatchScore(self, request, context):
         """Handle batch scoring for multiple nodes."""
         start_time = time.perf_counter()
         
         try:
+            from .metrics_schema import FEATURE_NAMES
+            import numpy as np
+            
             # SAFETY: Check for stale telemetry (Issue 3 fix)
             current_time_ms = int(time.time() * 1000)
             stale_nodes = []
@@ -162,34 +168,37 @@ class BrainServicer:
                 ]
                 return scheduler_pb2.BatchScoreResponse(scores=scores)
             
-            # Convert all node telemetry to snapshots
-            snapshots = [
-                [NodeMetricsSnapshot.from_proto(node)]
-                for node in request.nodes
-            ]
+            # Convert all node telemetry to snapshots and feature arrays
+            node_features_list = []
+            node_names = []
+            for node in request.nodes:
+                snap = NodeMetricsSnapshot.from_proto(node)
+                # Update cache for proactive rebalancing
+                self.last_telemetry_cache[node.node_name] = snap
+                node_names.append(node.node_name)
+                
+                # Extract features
+                features = []
+                for feat_name in FEATURE_NAMES:
+                    val = getattr(snap, feat_name, 0.0)
+                    features.append(float(val) if val is not None else 0.0)
+                node_features_list.append(features)
             
-            pod = PodContext(
-                pod_name=request.pod_requirements.pod_name,
-                pod_namespace=request.pod_requirements.pod_namespace,
-                cpu_milli=request.pod_requirements.cpu_milli,
-                memory_bytes=request.pod_requirements.memory_bytes,
-                workload_type=request.pod_requirements.workload_type or "unknown",
-            )
+            node_features = np.array(node_features_list, dtype=np.float32)
             
-            cluster_tensor = self.encoder.encode_node_snapshots(snapshots, pod)
+            # Build pod context features
+            pod_cpu_norm = min(request.pod_requirements.cpu_milli / 4000.0, 1.0)
+            pod_mem_norm = min(request.pod_requirements.memory_bytes / (16 * 1024**3), 1.0)
+            pod_features = np.array([pod_cpu_norm, pod_mem_norm, 0.5, 0.5, 0.5], dtype=np.float32)
             
-            # SAFETY: Configured timeout with fallback
-            try:
-                results = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        None, self.model.score_batch, cluster_tensor
-                    ),
-                    timeout=INFERENCE.MAX_LATENCY_MS / 1000.0
-                )
-            except asyncio.TimeoutError:
-                # Fallback: return neutral scores if inference takes > 45ms
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                self.last_latency_ms = int(elapsed_ms)
+            # Run model inference using new score_nodes interface
+            results = self.model.score_nodes(node_features, pod_features, node_names)
+            
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            self.last_latency_ms = int(elapsed_ms)
+            
+            # Check for timeout
+            if elapsed_ms > INFERENCE.MAX_LATENCY_MS:
                 scores = [
                     scheduler_pb2.NodeScore(
                         node_name=node.node_name,
@@ -201,15 +210,12 @@ class BrainServicer:
                 ]
                 return scheduler_pb2.BatchScoreResponse(scores=scores)
             
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self.last_latency_ms = int(elapsed_ms)
-            
             scores = [
                 scheduler_pb2.NodeScore(
-                    node_name=r["node_name"],
-                    score=r["score"],
-                    reasoning=r["reasoning"],
-                    confidence=r["confidence"],
+                    node_name=r.node_name,
+                    score=r.score,
+                    reasoning=r.reasoning,
+                    confidence=r.confidence,
                 )
                 for r in results
             ]
@@ -220,6 +226,7 @@ class BrainServicer:
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return scheduler_pb2.BatchScoreResponse(scores=[])
+
     
     async def HealthCheck(self, request, context):
         """Health check for circuit breaker."""
@@ -239,15 +246,28 @@ class BrainServer:
         self,
         uds_path: str = DEV_UDS_PATH,
         max_workers: int = 4,
-        model: Optional[AttentionScorer] = None,
+        model: Optional[BaseScorer] = None,
     ):
         self.uds_path = uds_path
         self.max_workers = max_workers
         self.servicer = BrainServicer(model=model)
         self.server: Optional[aio.Server] = None
+        
+        # Initialize Rebalancer (Phase 4)
+        from .rebalancer import Rebalancer
+        self.rebalancer = Rebalancer(
+            model=self.servicer.model,
+            encoder=self.servicer.encoder,
+            telemetry_cache=self.servicer.last_telemetry_cache
+        )
     
     async def start(self):
-        """Start the gRPC server on UDS."""
+        """Start the gRPC server on UDS and optionally TCP."""
+        # ... existing socket setup ...
+        
+        # Start Rebalancer background task (Phase 4)
+        asyncio.create_task(self.rebalancer.start())
+        
         # Ensure socket directory exists
         socket_dir = os.path.dirname(self.uds_path)
         if socket_dir and not os.path.exists(socket_dir):
@@ -274,9 +294,13 @@ class BrainServer:
         # Bind to UDS
         self.server.add_insecure_port(f"unix://{self.uds_path}")
         
-        print(f"🧠 Brain server starting on unix://{self.uds_path}")
+        # Also bind to TCP port for Kubernetes health checks and external access
+        tcp_port = os.environ.get("BRAIN_TCP_PORT", "50051")
+        self.server.add_insecure_port(f"[::]:{tcp_port}")
+        
+        print(f"Brain server starting on unix://{self.uds_path} and TCP port {tcp_port}")
         await self.server.start()
-        print(f"✅ Brain server ready!")
+        print(f"Brain server ready!")
     
     async def stop(self):
         """Stop the server gracefully."""
@@ -284,7 +308,8 @@ class BrainServer:
             await self.server.stop(grace=5)
         if os.path.exists(self.uds_path):
             os.unlink(self.uds_path)
-        print("🛑 Brain server stopped")
+        print("Brain server stopped")
+
     
     async def wait_for_termination(self):
         """Wait for server termination."""

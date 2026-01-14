@@ -2,255 +2,195 @@
 
 ## Overview
 
-KubeAttention uses a **Transformer neural network** to score Kubernetes nodes based on real-time telemetry. The key innovation is using **attention mechanisms** to detect noisy neighbor patterns that traditional schedulers miss, combined with a **high-performance Go middleware** that ensures zero impact on scheduling throughput.
+KubeAttention uses lightweight machine learning models (MLP or XGBoost) to score Kubernetes nodes based on real-time eBPF telemetry. The system detects noisy neighbor patterns that traditional schedulers miss, combined with a high-performance Go middleware that ensures minimal impact on scheduling throughput.
+
+The previous Transformer-based architecture has been replaced with simpler, faster models that achieve the same accuracy with sub-millisecond inference latency.
 
 ---
 
 ## System Components
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         KubeAttention                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐         gRPC/UDS          ┌────────────────┐  │
-│  │    Gopher    │◄────────────────────────►│     Brain       │  │
-│  │  Score Plugin│        (BatchScore)       │   Transformer   │  │
-│  └──────┬───────┘                           └───────┬────────┘  │
-│         │                                           │           │
-│  ┌──────▼──────┐                                    │ PyTorch   │
-│  │ Telemetry   │                                    │           │
-│  │   Store     │                                    ▼           │
-│  └──────┬──────┘                            ┌────────────────┐  │
-│         │ eBPF/K8s Metrics                  │   Tetragon     │  │
-│         └──────────────────────────────────►│  eBPF Metrics  │  │
-│                                             └────────────────┘  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+                           KubeAttention
++----------------------------------------------------------------+
+|                                                                 |
+|  +-------------+         gRPC/UDS          +------------------+ |
+|  |   Gopher    |<------------------------->|      Brain       | |
+|  | Score Plugin|       (BatchScore)        | (MLP / XGBoost)  | |
+|  +------+------+                           +--------+---------+ |
+|         |                                           |           |
+|  +------v------+                                    | PyTorch / |
+|  | Telemetry   |                                    | XGBoost   |
+|  |   Store     |                                    v           |
+|  +------+------+                           +------------------+ |
+|         |                                  |    Tetragon      | |
+|         +--------------------------------->| (eBPF Metrics)   | |
+|                                            +------------------+ |
++----------------------------------------------------------------+
 ```
 
 ---
 
-## The Brain: Transformer Architecture
+## The Brain: Model Architecture
 
-### Input: ClusterTensor
+### Model Options
 
-The Brain receives cluster state encoded as a **ClusterTensor**:
+KubeAttention supports two scoring models, selectable via `brain/config.py`:
+
+| Model | Parameters | Inference | Training | Model Size |
+|-------|------------|-----------|----------|------------|
+| MLP (2-layer) | ~3,500 | 0.05ms | 2.5s | 16KB |
+| XGBoost | ~6,400 trees | 0.34ms | 0.1s | 100KB |
+
+**Default**: MLP is recommended for production due to lower inference latency.
+
+### MLP Architecture
 
 ```
-ClusterTensor {
-    node_features: Tensor[N, T, F]    # N nodes × T timesteps × F features
-    pod_context:   Tensor[P]          # Pod requirements vector
-    attention_mask: Tensor[N]         # Valid node mask
+Input (20 features)
+    |
+    v
++-------------------+
+| Linear(20 -> 64)  |
+| ReLU              |
++-------------------+
+    |
+    v
++-------------------+
+| Linear(64 -> 32)  |
+| ReLU              |
++-------------------+
+    |
+    v
++-------------------+     +-------------------+
+| Score Head        |     | Confidence Head   |
+| Linear(32 -> 1)   |     | Linear(32 -> 1)   |
+| Sigmoid * 100     |     | Sigmoid           |
++-------------------+     +-------------------+
+    |                         |
+    v                         v
+ Score [0-100]          Confidence [0-1]
+```
+
+**Code**: `brain/models/mlp_scorer.py`
+
+### XGBoost Architecture
+
+- Gradient boosted decision trees (100 estimators)
+- Max depth of 6 per tree
+- Trained with squared error objective
+- Min-max score normalization at inference
+
+**Code**: `brain/models/xgboost_scorer.py`
+
+---
+
+## Feature Set
+
+The Brain receives 15 eBPF-derived features plus 5 pod context features:
+
+### Node Features (15)
+
+| Feature | Source | Purpose |
+|---------|--------|---------|
+| cpu_utilization | sched:sched_stat_runtime | Basic CPU load |
+| cpu_throttle_rate | cgroup:cgroup_throttle | CPU contention indicator |
+| memory_utilization | kprobe:__alloc_pages | Memory pressure |
+| memory_bandwidth_gbps | perf:mem_load_retired | Noisy neighbor signal |
+| l3_cache_miss_rate | perf:cache_misses | Critical: LLC contention |
+| l3_cache_occupancy_mb | perf:llc_occupancy | Cache pressure |
+| disk_io_wait_ms | block:block_rq_complete | I/O bottleneck |
+| disk_iops | block:block_rq_issue | I/O load |
+| network_rx_packets_sec | net:netif_receive_skb | Network load |
+| network_tx_packets_sec | net:net_dev_xmit | Network load |
+| network_drop_rate | skb:kfree_skb | Network saturation |
+| node_cost_index | metadata | Cost optimization |
+| is_spot_instance | metadata | Resilience scoring |
+| spot_interruption_risk | metadata | Risk assessment |
+| zone_diversity_score | computed | Zone spread incentive |
+
+### Pod Context Features (5)
+
+| Feature | Description |
+|---------|-------------|
+| cpu_normalized | Requested CPU / 4000m |
+| memory_normalized | Requested memory / 16GB |
+| workload_type | One-hot encoded (cpu/mem/io/balanced) |
+| criticality | Priority level (low/medium/high) |
+| priority | Scheduling priority weight |
+
+---
+
+## Scoring Pipeline
+
+### Input Processing
+
+```python
+# Node features: (N, 15) matrix for N candidate nodes
+node_features = extract_from_telemetry_cache(nodes)
+
+# Pod features: (5,) vector for the pod being scheduled
+pod_features = encode_pod_context(pod)
+
+# Concatenate for model input: (N, 20)
+X = concatenate(node_features, broadcast(pod_features, N))
+```
+
+### Forward Pass
+
+```python
+# MLP inference
+scores, confidences = model(X)  # Returns (N,) scores in [0, 100]
+
+# Generate reasoning for each node
+for i, node in enumerate(nodes):
+    reasoning = generate_reasoning(node.name, scores[i], node_features[i])
+```
+
+### Output
+
+```
+ScoringResult {
+    node_name: str       # "node-1"
+    score: int           # 0-100 (higher is better)
+    confidence: float    # 0-1 (model's confidence)
+    reasoning: str       # "Node node-1: low CPU load, ample memory (CPU=30%, Mem=40%)"
 }
 ```
 
-Where:
-- **N** = Number of candidate nodes (typically 3-100)
-- **T** = Temporal window (default: 10 timesteps)
-- **F** = 11 eBPF features from Tetragon
-- **P** = 7 pod context features
-
-### Feature Set (F=11)
-
-| # | Feature | Source | Why It Matters |
-|---|---------|--------|----------------|
-| 1 | cpu_utilization | sched:sched_stat_runtime | Basic load |
-| 2 | cpu_throttle_rate | cgroup:cgroup_throttle | CPU contention |
-| 3 | memory_utilization | kprobe:__alloc_pages | Memory pressure |
-| 4 | memory_bandwidth_gbps | perf:mem_load_retired | **Noisy neighbor signal** |
-| 5 | l3_cache_miss_rate | perf:cache_misses | **Critical: LLC contention** |
-| 6 | l3_cache_occupancy_mb | perf:llc_occupancy | Cache pressure |
-| 7 | disk_io_wait_ms | block:block_rq_complete | I/O bottleneck |
-| 8 | disk_iops | block:block_rq_issue | I/O load |
-| 9 | network_rx_packets_sec | net:netif_receive_skb | Network load |
-| 10 | network_tx_packets_sec | net:net_dev_xmit | Network load |
-| 11 | network_drop_rate | skb:kfree_skb | Network saturation |
-
 ---
-
-## Attention Mechanisms
-
-The Brain uses **two types of attention** to understand cluster state:
-
-### 1. Node Self-Attention
-
-```
-                    ┌─────────────────────────────────┐
-                    │     Node Self-Attention         │
-                    │                                 │
-   Node 1 ──────────┤  Q₁ ─────────┐                 │
-   Node 2 ──────────┤  Q₂ ─────────┼──► Attention ───┼──► Updated Nodes
-   Node 3 ──────────┤  Q₃ ─────────┘    Weights      │
-                    │                                 │
-                    │  "Which nodes affect each      │
-                    │   other's performance?"        │
-                    └─────────────────────────────────┘
-```
-
-**Purpose**: Detect inter-node relationships.
-
-**How it works**:
-1. Each node generates Query (Q), Key (K), Value (V) vectors
-2. Attention scores: `softmax(Q · K^T / √d)`
-3. Nodes "attend" to other nodes with correlated telemetry
-
-**What it learns**:
-- Nodes on the same rack often have correlated network patterns
-- Nodes with high L3 cache miss rates often share noisy neighbors
-- Memory bandwidth saturation propagates across NUMA nodes
-
-**Code**: [`brain/model.py:NodeAttentionBlock`](file:///Users/pradeepsingh/code/tools/KubeAttention/brain/model.py#L35-L90)
-
-```python
-class NodeAttentionBlock(nn.Module):
-    def forward(self, x, mask):
-        # x: (B, N, D) - batch × nodes × features
-        
-        q = self.q_proj(x)  # What am I looking for?
-        k = self.k_proj(x)  # What do I have?
-        v = self.v_proj(x)  # What information to share?
-        
-        # Scaled dot-product attention
-        attn = softmax(q @ k.T / sqrt(d))  # (N, N) attention matrix
-        
-        # Each node aggregates info from related nodes
-        out = attn @ v
-        return out
-```
-
----
-
-### 2. Pod Cross-Attention (The Key Innovation)
-
-```
-                    ┌─────────────────────────────────┐
-                    │     Pod Cross-Attention         │
-                    │                                 │
-   Node 1 ──────────┤  Q₁ ─────┐                     │
-   Node 2 ──────────┤  Q₂ ─────┼──► Attention ───────┼──► Pod-Aware Scores
-   Node 3 ──────────┤  Q₃ ─────┘    to Pod          │
-                    │              ▲                  │
-                    │              │                  │
-   Pod Context ─────┤──────────────┘                 │
-   (cpu, mem,       │  K, V                          │
-    workload_type)  │  "How well does this node     │
-                    │   match the pod's needs?"      │
-                    └─────────────────────────────────┘
-```
-
-**Purpose**: Context-aware scoring based on pod requirements.
-
-**How it works**:
-1. Pod requirements become Key (K) and Value (V)
-2. Each node generates Query (Q) asking "Am I suitable?"
-3. Cross-attention computes relevance: `softmax(Q_node · K_pod^T)`
-
-**What it learns**:
-- CPU-bound pods should avoid nodes with high throttle rates
-- Memory-bound pods need nodes with available bandwidth
-- I/O-bound pods need low disk wait times
-
-**Code**: [`brain/model.py:PodCrossAttention`](file:///Users/pradeepsingh/code/tools/KubeAttention/brain/model.py#L93-L140)
-
-```python
-class PodCrossAttention(nn.Module):
-    def forward(self, nodes, pod_ctx):
-        # nodes: (B, N, D)
-        # pod_ctx: (B, P) - pod requirements
-        
-        q = self.q_proj(nodes)      # Node asks: "Am I suitable?"
-        k = self.k_proj(pod_ctx)    # Pod says: "I need these resources"
-        v = self.v_proj(pod_ctx)    # Pod provides: context for scoring
-        
-        # Each node attends to pod requirements
-        attn = softmax(q @ k.T / sqrt(d))
-        
-        # Nodes update their representations with pod context
-        out = attn @ v
-        return nodes + out  # Residual connection
-```
-
----
-
-## Full Forward Pass
-
-```
-Input: ClusterTensor
-         │
-         ▼
-┌─────────────────────────────────┐
-│  1. Feature Projection          │
-│     (F=11) → (D=128)            │
-└─────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────┐
-│  2. Temporal Pooling            │
-│     Mean over T timesteps       │
-└─────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────┐
-│  3. Node Self-Attention ×3      │  ← "Which nodes are related?"
-│     Multi-head (4 heads)        │
-└─────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────┐
-│  4. Pod Cross-Attention         │  ← "Which node fits the pod?"
-│     Nodes attend to pod reqs    │
-└─────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────┐
-│  5. Score Head                  │
-│     Linear → Sigmoid × 100      │
-└─────────────────────────────────┘
-         │
-         ▼
-Output: scores[N], confidence[N]
-        (0-100 per node)
-```
 
 ## High-Performance Gopher Plugin
 
-To meet the strict latency requirements of the Kubernetes scheduler, the Go plugin (`Gopher`) implements several critical optimizations:
+To meet the strict latency requirements of the Kubernetes scheduler, the Go plugin implements several critical optimizations:
 
-### 1. TelemetryStore (Background Polling)
-The `TelemetryStore` runs as a singleton background process. It periodically fetches metrics from Tetragon and Prometheus, keeping a hot cache of node states. This ensures that the `Score` function **never** makes a synchronous network call to fetch metrics.
+### TelemetryStore (Background Polling)
 
-### 2. PreScore Batching
-Instead of calling the Brain gRPC endpoint for every node sequentially (which would scale O(N) where N is the number of nodes), KubeAttention uses the `PreScore` phase to send **one batch request** for all candidate nodes. This reduces the total scheduling overhead to O(1) gRPC roundtrips.
+The TelemetryStore runs as a singleton background process. It periodically fetches metrics from Tetragon and caches node states. This ensures that the Score function never makes a synchronous network call to fetch metrics.
 
-### 3. Circuit Breaker & Safety
-The `BrainClient` monitors latency and error rates. If the Brain takes >45ms or returns errors, the plugin automatically trips the circuit breaker and falls back to neutral scores, ensuring cluster stability even if the AI components fail.
+### PreScore Batching
 
-### Traditional Schedulers
+Instead of calling the Brain gRPC endpoint for every node sequentially (which would scale O(N) where N is the number of nodes), KubeAttention uses the PreScore phase to send one batch request for all candidate nodes. This reduces the total scheduling overhead to O(1) gRPC roundtrips.
 
-**Problem**: Score each node independently.
+### Circuit Breaker and Safety
 
-```
-score(node) = f(node_metrics)  # No context about other nodes or pod
-```
+The BrainClient monitors latency and error rates. If the Brain takes over 45ms or returns errors, the plugin automatically trips the circuit breaker and falls back to neutral scores (50/100), ensuring cluster stability even if the ML components fail.
 
-### KubeAttention
+---
 
-**Solution**: Score nodes in context of:
-1. **Other nodes** (self-attention) - detect cluster-wide patterns
-2. **Pod requirements** (cross-attention) - match workload needs
+## Why Lightweight Models?
 
-```
-score(node) = Attention(node, all_nodes, pod_requirements)
-```
+The original Transformer architecture was replaced for several reasons:
 
-### Example: Detecting L3 Cache Contention
+| Concern | Transformer | MLP/XGBoost |
+|---------|-------------|-------------|
+| Inference latency | 5-10ms | 0.05-0.34ms |
+| Model complexity | ~500K params | ~3.5K params |
+| Memory footprint | 2GB+ | 16-100KB |
+| Training time | Hours | Seconds |
+| Cold start | Slow | Instant |
 
-1. **Input**: Node A has high `l3_cache_miss_rate` (0.8)
-2. **Self-Attention**: Node A attends to Node B (same rack, similar pattern)
-3. **Cross-Attention**: Incoming pod is "memory-bound" workload type
-4. **Output**: Node A gets low score (15/100) - avoid cache contention
-5. **Result**: Pod scheduled to Node C (clean node, score 85/100)
+The key insight is that node scoring is primarily a tabular regression problem. The input features are well-structured eBPF metrics, not sequences or images. Simple models perform equally well with dramatically better latency.
 
 ---
 
@@ -258,35 +198,42 @@ score(node) = Attention(node, all_nodes, pod_requirements)
 
 ### Data Collection
 
-```python
-# Collect (cluster_state, pod, outcome) tuples
-training_data = []
-for scheduling_event in shadow_mode_events:
-    cluster_tensor = collect_telemetry(event.timestamp)
-    pod_context = encode_pod(event.pod)
-    
-    # Label: Did the actual placement result in good latency?
-    label = measure_pod_performance(event.pod, event.node)
-    
-    training_data.append((cluster_tensor, pod_context, label))
-```
-
-### Loss Function
+Training data is collected via the Collector component watching scheduling events:
 
 ```python
-# Binary cross-entropy on "good placement" prediction
-loss = BCE(predicted_score, actual_performance_label)
+# Each training sample contains:
+{
+    "node_telemetry": {...},    # 15 features per node
+    "pod_context": {...},       # Pod requirements
+    "chosen_node": "node-1",    # Where scheduler placed the pod
+    "outcome": "running",       # running / oom_killed / evicted
+}
 ```
+
+### Label Construction
+
+| Outcome | Label | Weight |
+|---------|-------|--------|
+| running | 1.0 | 1.0 |
+| restarted | 0.5 | 1.5 |
+| terminated | 0.3 | 2.0 |
+| oom_killed | 0.0 | 3.0 |
+| evicted | 0.0 | 3.0 |
 
 ### Training Loop
 
 ```python
-for epoch in range(100):
-    for cluster, pod, label in dataloader:
-        scores, confidence = model(cluster, pod)
-        loss = BCE(scores, label) + confidence_regularization
-        loss.backward()
-        optimizer.step()
+# Load data with pod context features
+X, y, weights = prepare_training_data("events.jsonl")
+
+# Initialize model
+model = get_model("mlp", input_dim=X.shape[1])
+
+# Train
+model.train(X, y, weights=weights, epochs=50, lr=1e-3)
+
+# Save
+model.save("checkpoints/best_model.pt")
 ```
 
 ---
@@ -295,14 +242,27 @@ for epoch in range(100):
 
 | Constraint | Target | Implementation |
 |------------|--------|----------------|
-| Inference Latency | <50ms | Circuit breaker fallback |
-| Memory Footprint | <2GB | Int8 quantization |
-| Model Size | ~500K params | 3 attention layers, D=128 |
+| Inference Latency | < 1ms | Lightweight MLP |
+| Fallback Behavior | 50/100 score | Circuit breaker |
+| Telemetry Staleness | < 10s | Staleness guard |
+| Memory Footprint | < 50MB | No GPU required |
+
+---
+
+## Proactive Rebalancer (Phase 4)
+
+The Rebalancer runs as a background audit loop that identifies pods on sub-optimal nodes:
+
+1. Scans all running pods every 60 seconds
+2. Scores current node vs all alternatives
+3. If current node scores below 40 AND an alternative is 20+ points better:
+   - Annotates the pod with `kubeattention.io/rebalance-target`
+   - External controller can use this annotation to trigger eviction
 
 ---
 
 ## Further Reading
 
-- [Attention Is All You Need](https://arxiv.org/abs/1706.03762) - Original Transformer paper
 - [Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)
 - [Tetragon eBPF](https://tetragon.io/) - Runtime security observability
+- [XGBoost Documentation](https://xgboost.readthedocs.io/)

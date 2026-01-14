@@ -32,6 +32,7 @@ class PodContext:
     cpu_milli: int
     memory_bytes: int
     workload_type: str = "unknown"
+    criticality: str = "unknown"  # Phase 2: low, medium, high, unknown
     labels: dict[str, str] = None
     
     # Feature names for dynamic dimension calculation
@@ -39,6 +40,9 @@ class PodContext:
     
     # Workload type categories (order matters for one-hot encoding)
     WORKLOAD_TYPES: list[str] = None  # Set after class definition
+    
+    # Criticality levels (Phase 2)
+    CRITICALITY_LEVELS: list[str] = None  # Set after class definition
     
     def __post_init__(self):
         if self.labels is None:
@@ -57,15 +61,51 @@ class PodContext:
         # Workload type one-hot encoding
         workload_onehot = [1.0 if self.workload_type == wt else 0.0 for wt in PodContext.WORKLOAD_TYPES]
         
-        return [cpu_norm, mem_norm] + workload_onehot
+        # Criticality one-hot encoding (Phase 2)
+        criticality_onehot = [1.0 if self.criticality == cl else 0.0 for cl in PodContext.CRITICALITY_LEVELS]
+        
+        return [cpu_norm, mem_norm] + workload_onehot + criticality_onehot
 
 
 # Class-level constants (set after class definition to avoid dataclass issues)
 PodContext.WORKLOAD_TYPES = ["cpu-bound", "memory-bound", "io-bound", "balanced", "unknown"]
-PodContext.FEATURE_NAMES = ["cpu_normalized", "memory_normalized"] + [f"workload_{wt}" for wt in PodContext.WORKLOAD_TYPES]
+PodContext.CRITICALITY_LEVELS = ["unknown", "low", "medium", "high"]  # Phase 2
+PodContext.FEATURE_NAMES = (
+    ["cpu_normalized", "memory_normalized"] 
+    + [f"workload_{wt}" for wt in PodContext.WORKLOAD_TYPES]
+    + [f"criticality_{cl}" for cl in PodContext.CRITICALITY_LEVELS]  # Phase 2
+)
 
 # Derived constant for use in model.py
 POD_CONTEXT_DIM = len(PodContext.FEATURE_NAMES)
+
+
+def encode_zone_diversity(zones: list[str], target_zone: str) -> float:
+    """Compute zone diversity score (Phase 4).
+    
+    Returns 1.0 if placing in target_zone improves spread, 0.0 if it worsens.
+    The score incentivizes placing pods in underutilized zones.
+    
+    Args:
+        zones: List of availability zones for all candidate nodes
+        target_zone: The zone of the node being scored
+        
+    Returns:
+        Diversity score between 0.0 and 1.0
+    """
+    from collections import Counter
+    
+    if not zones:
+        return 0.5  # Neutral if no zone information
+    
+    zone_counts = Counter(zones)
+    target_count = zone_counts.get(target_zone, 0)
+    avg_count = sum(zone_counts.values()) / len(zone_counts) if zone_counts else 1
+    
+    # Prefer zones with fewer existing pods
+    diversity_score = 1.0 - (target_count / (avg_count * 2))
+    return max(0.0, min(1.0, diversity_score))
+
 
 
 @dataclass  
@@ -125,7 +165,7 @@ class ClusterTensorEncoder(nn.Module):
         feature_dim: int = FEATURE_DIM,
         max_nodes: int = 100,
         max_seq_len: int = 10,
-        pod_context_dim: int = 7,  # cpu, mem, 5 workload types
+        pod_context_dim: int = 11,  # cpu, mem, 5 workload types, 4 criticality levels
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -173,9 +213,21 @@ class ClusterTensorEncoder(nn.Module):
         node_names = []
         timestamps = torch.zeros(seq_len)
         
+        # Calculate zone diversity if snapshots contain zone information (Phase 4)
+        all_zones = [ns[0].availability_zone for ns in snapshots if ns and ns[0].availability_zone != "unknown"]
+        
         for i, node_snapshots in enumerate(snapshots):
             node_names.append(node_snapshots[0].node_name if node_snapshots else f"node-{i}")
+            
+            # Compute zone diversity for this node's zone
+            z_score = 0.5
+            if node_snapshots and node_snapshots[0].availability_zone != "unknown":
+                z_score = encode_zone_diversity(all_zones, node_snapshots[0].availability_zone)
+            
             for t, snapshot in enumerate(node_snapshots):
+                # Update snapshot with computed diversity score
+                snapshot.zone_diversity_score = z_score
+                
                 features = snapshot.to_feature_vector()
                 node_features[i, t, :] = torch.tensor(features)
                 if i == 0:

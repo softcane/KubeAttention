@@ -142,6 +142,44 @@ TETRAGON_METRICS_SCHEMA: list[TetragonMetricSpec] = [
         description="Network packet drop rate",
         ebpf_probe="tracepoint:skb:kfree_skb",
     ),
+    
+    # Meta Metrics (Phase 2 & 4)
+    TetragonMetricSpec(
+        name="node_cost_index",
+        category=MetricCategory.NETWORK,  # Reusing category or adding META
+        unit="index",
+        min_value=0.0,
+        max_value=1.0,
+        description="Relative cost index of the instance type",
+        ebpf_probe="static:node_labels",
+    ),
+    TetragonMetricSpec(
+        name="zone_diversity_score",
+        category=MetricCategory.NETWORK,
+        unit="index",
+        min_value=0.0,
+        max_value=1.0,
+        description="Zone diversity score for resilience",
+        ebpf_probe="static:topology",
+    ),
+    TetragonMetricSpec(
+        name="spot_interruption_risk",
+        category=MetricCategory.NETWORK,
+        unit="index",
+        min_value=0.0,
+        max_value=1.0,
+        description="Risk of spot interruption",
+        ebpf_probe="static:node_labels",
+    ),
+    TetragonMetricSpec(
+        name="is_spot_instance",
+        category=MetricCategory.NETWORK,
+        unit="bool",
+        min_value=0.0,
+        max_value=1.0,
+        description="Boolean for Spot/Preemptible status",
+        ebpf_probe="static:node_labels",
+    ),
 ]
 
 
@@ -172,11 +210,28 @@ class NodeMetricsSnapshot:
     network_tx_packets_sec: float = 0.0
     network_drop_rate: float = 0.0
     
+    # Cost (Phase 2)
+    node_cost_index: float = 0.0
+    is_spot_instance: bool = False
+    
+    # Resilience (Phase 4)
+    availability_zone: str = "unknown"
+    zone_diversity_score: float = 0.5
+    spot_interruption_risk: float = 0.0
+    
     def to_feature_vector(self) -> list[float]:
         """Convert to normalized feature vector for model input."""
         features = []
         for spec in TETRAGON_METRICS_SCHEMA:
+            if spec.name == "is_spot_instance":
+                features.append(1.0 if self.is_spot_instance else 0.0)
+                continue
+                
             value = getattr(self, spec.name)
+            if isinstance(value, str):
+                # Strings (like zone) are handled via zone_diversity_score helper
+                continue
+                
             # Normalize to [0, 1] range
             normalized = (value - spec.min_value) / (spec.max_value - spec.min_value + 1e-8)
             features.append(max(0.0, min(1.0, normalized)))
@@ -199,6 +254,10 @@ class NodeMetricsSnapshot:
             network_rx_packets_sec=proto_telemetry.network_rx_packets_sec,
             network_tx_packets_sec=proto_telemetry.network_tx_packets_sec,
             network_drop_rate=proto_telemetry.network_drop_rate,
+            node_cost_index=getattr(proto_telemetry, "cost_per_hour", 0.0),
+            is_spot_instance=getattr(proto_telemetry, "is_spot_instance", False),
+            availability_zone=getattr(proto_telemetry, "availability_zone", "unknown"),
+            spot_interruption_risk=getattr(proto_telemetry, "spot_interruption_risk", 0.0),
         )
 
 

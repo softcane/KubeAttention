@@ -1,0 +1,64 @@
+# Redis Benchmark - Latency-Sensitive Workload
+# This is what we're trying to protect from noisy neighbors
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-latency-test
+  namespace: benchmark
+  labels:
+    app: redis-latency-test
+    role: latency-sensitive
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: redis-latency-test
+  template:
+    metadata:
+      labels:
+        app: redis-latency-test
+        role: latency-sensitive
+      annotations:
+        # KubeAttention annotation for high criticality
+        kubeattention.io/criticality: "high"
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          # Liveness probe to measure responsiveness
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+            periodSeconds: 5
+        
+        # Sidecar to continuously measure P99 latency
+        - name: latency-probe
+          image: redis:7-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              while true; do
+                START=$(date +%s%N)
+                redis-cli -h localhost PING > /dev/null 2>&1
+                END=$(date +%s%N)
+                LATENCY=$(( (END - START) / 1000000 ))
+                echo "latency_ms=$LATENCY"
+                sleep 0.1
+              done
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"

@@ -80,7 +80,7 @@ def run_battle():
     random.seed(42)  # Reproducible results
     
     # Scenario 1: Default Scheduler (victim on noisy node)
-    print("📊 Scenario 1: Default Kubernetes Scheduler")
+    print("Scenario 1: Default Kubernetes Scheduler")
     print("   Victim pod co-located with L3 Cache Stress pod")
     print("   ─" * 25)
     
@@ -95,7 +95,7 @@ def run_battle():
     print()
     
     # Scenario 2: KubeAttention Scheduler (victim isolated)
-    print("📊 Scenario 2: KubeAttention Scheduler")
+    print("Scenario 2: KubeAttention Scheduler")
     print("   Victim pod placed on clean node (Brain detected contention)")
     print("   ─" * 25)
     
@@ -116,7 +116,7 @@ def run_battle():
                        / default_stats['p50'] * 100)
     
     print("=" * 60)
-    print("📈 RESULTS")
+    print("RESULTS")
     print("=" * 60)
     print()
     print(f"   P99 Latency Improvement: {p99_improvement:.1f}%")
@@ -125,9 +125,9 @@ def run_battle():
     
     if p99_improvement > 15:
         print("   🎉 SUCCESS! Improvement exceeds 15% threshold!")
-        print("   ✅ Ready for Open Source launch!")
+        print("   Ready for Open Source launch!")
     else:
-        print("   ⚠️  Improvement below 15% threshold")
+        print("   Improvement below 15% threshold")
     
     print()
     
