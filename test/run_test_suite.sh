@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_NAME="kubeattention"
 
 echo "=============================================="
-echo "🧪 KubeAttention Noisy Neighbor Test Suite"
+echo "KubeAttention Noisy Neighbor Test Suite"
 echo "=============================================="
 echo
 
@@ -20,28 +20,28 @@ NC='\033[0m' # No Color
 
 # Check prerequisites
 check_prereqs() {
-    echo "📋 Checking prerequisites..."
+    echo "Checking prerequisites..."
     
     if ! command -v kind &> /dev/null; then
-        echo -e "${RED}❌ kind not found. Install: brew install kind${NC}"
+        echo -e "${RED}kind not found. Install: brew install kind${NC}"
         exit 1
     fi
     
     if ! command -v kubectl &> /dev/null; then
-        echo -e "${RED}❌ kubectl not found. Install: brew install kubectl${NC}"
+        echo -e "${RED}kubectl not found. Install: brew install kubectl${NC}"
         exit 1
     fi
     
-    echo -e "${GREEN}✅ Prerequisites met${NC}"
+    echo -e "${GREEN}Prerequisites met${NC}"
     echo
 }
 
 # Create or reuse cluster
 setup_cluster() {
-    echo "🏗️  Setting up Kind cluster..."
+    echo "Setting up Kind cluster..."
     
     if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
-        echo -e "${YELLOW}⚠️  Cluster '${CLUSTER_NAME}' already exists${NC}"
+        echo -e "${YELLOW}Cluster '${CLUSTER_NAME}' already exists${NC}"
         read -p "Delete and recreate? (y/N) " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -53,13 +53,13 @@ setup_cluster() {
     fi
     
     kind create cluster --config "${SCRIPT_DIR}/kind-config.yaml" --name "${CLUSTER_NAME}"
-    echo -e "${GREEN}✅ Cluster created${NC}"
+    echo -e "${GREEN}Cluster created${NC}"
     echo
 }
 
 # Deploy stress pods
 deploy_stress() {
-    echo "😈 Deploying stress pods (noisy neighbors)..."
+    echo "Deploying stress pods (noisy neighbors)..."
     
     # Create namespace
     kubectl apply -f "${SCRIPT_DIR}/noisy_neighbor/workload.yaml"
@@ -76,24 +76,24 @@ deploy_stress() {
     echo "  → Cache stress pod (L3 cache contention)..."
     kubectl apply -f "${SCRIPT_DIR}/noisy_neighbor/cache_stress.yaml"
     
-    echo -e "${GREEN}✅ Stress pods deployed${NC}"
+    echo -e "${GREEN}Stress pods deployed${NC}"
     echo
 }
 
 # Wait for stress pods to be running
 wait_for_stress() {
-    echo "⏳ Waiting for stress pods to start..."
+    echo "Waiting for stress pods to start..."
     
     kubectl wait --for=condition=Ready pods -l app=stress-test \
         -n noisy-neighbor-test --timeout=60s || true
     
-    echo -e "${GREEN}✅ Stress pods running${NC}"
+    echo -e "${GREEN}Stress pods running${NC}"
     echo
 }
 
 # Deploy victim workload and observe scheduling
 test_scheduling() {
-    echo "🎯 Testing scheduling decisions..."
+    echo "Testing scheduling decisions..."
     echo
     
     echo "Scheduling victim deployment (5 replicas)..."
@@ -102,7 +102,7 @@ test_scheduling() {
     sleep 10
     
     echo
-    echo "📊 Pod Distribution:"
+    echo "Pod Distribution:"
     echo "─────────────────────────────────────────"
     kubectl get pods -n noisy-neighbor-test -o wide | grep victim
     
@@ -117,7 +117,7 @@ test_scheduling() {
 
 # Show node resource usage
 show_node_metrics() {
-    echo "📈 Node Resource Usage:"
+    echo "Node Resource Usage:"
     echo "─────────────────────────────────────────"
     kubectl top nodes 2>/dev/null || echo "Metrics server not installed"
     echo
@@ -147,9 +147,9 @@ compare_schedulers() {
     echo "  Victims on clean node: $clean_count / $total_victims"
     
     if [ "$clean_count" -gt 2 ]; then
-        echo -e "  ${GREEN}✅ Good: Majority of victims on clean node${NC}"
+        echo -e "  ${GREEN}Good: Majority of victims on clean node${NC}"
     else
-        echo -e "  ${YELLOW}⚠️  Default scheduler didn't avoid noisy nodes${NC}"
+        echo -e "  ${YELLOW}Default scheduler didn't avoid noisy nodes${NC}"
         echo "  KubeAttention would improve this!"
     fi
     echo
@@ -157,7 +157,7 @@ compare_schedulers() {
 
 # Cleanup
 cleanup() {
-    echo "🧹 Cleanup options:"
+    echo "Cleanup options:"
     echo "  1. Delete test namespace: kubectl delete ns noisy-neighbor-test"
     echo "  2. Delete cluster: kind delete cluster --name ${CLUSTER_NAME}"
     echo
@@ -175,7 +175,7 @@ main() {
     cleanup
     
     echo "=============================================="
-    echo -e "${GREEN}🎉 Test suite complete!${NC}"
+    echo -e "${GREEN}Test suite complete!${NC}"
     echo "=============================================="
 }
 

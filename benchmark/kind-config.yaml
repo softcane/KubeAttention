@@ -1,0 +1,53 @@
+# Kind Cluster Configuration for KubeAttention Benchmark
+# Optimized for 14-core laptop: 1 control-plane + 6 workers
+# Total: ~2 CPU cores per node (14 cores / 7 nodes)
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kubeattention-benchmark
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+  
+  # Worker nodes - simulate different "profiles"
+  - role: worker
+    labels:
+      kubeattention.io/profile: "noisy-1"
+      topology.kubernetes.io/zone: "zone-a"
+  
+  - role: worker
+    labels:
+      kubeattention.io/profile: "quiet-1"
+      topology.kubernetes.io/zone: "zone-a"
+  
+  - role: worker
+    labels:
+      kubeattention.io/profile: "noisy-2"
+      topology.kubernetes.io/zone: "zone-b"
+  
+  - role: worker
+    labels:
+      kubeattention.io/profile: "quiet-2"
+      topology.kubernetes.io/zone: "zone-b"
+  
+  - role: worker
+    labels:
+      kubeattention.io/profile: "mixed-1"
+      topology.kubernetes.io/zone: "zone-c"
+  
+  - role: worker
+    labels:
+      kubeattention.io/profile: "mixed-2"
+      topology.kubernetes.io/zone: "zone-c"
+
+# Resource limits for Kind nodes (prevents laptop overload)
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      snapshotter = "overlayfs"

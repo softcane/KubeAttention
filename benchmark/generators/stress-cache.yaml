@@ -1,0 +1,48 @@
+# Stress-Cache Generator
+# Creates L3 cache contention to simulate noisy neighbor
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stress-cache
+  namespace: benchmark
+  labels:
+    app: stress-cache
+    role: noisy-neighbor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stress-cache
+  template:
+    metadata:
+      labels:
+        app: stress-cache
+        role: noisy-neighbor
+    spec:
+      containers:
+        - name: stress
+          image: polinux/stress-ng:latest
+          args:
+            - "--cache"
+            - "2"              # 2 cache stressors
+            - "--cache-ways"
+            - "12"             # Target L3 cache ways
+            - "--timeout"
+            - "0"              # Run indefinitely
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+      # Prefer noisy nodes (for controlled testing)
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubeattention.io/profile
+                    operator: In
+                    values: ["noisy-1", "noisy-2"]

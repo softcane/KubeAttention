@@ -83,7 +83,7 @@ def calculate_p99_windows(latencies, window=5):
 
 def main():
     print("=" * 60)
-    print("📊 Latency vs Utilization Analysis")
+    print("Latency vs Utilization Analysis")
     print("=" * 60)
     print()
     
@@ -112,8 +112,8 @@ def main():
     stress_default = sum(default_p99[STRESSOR_START:STRESSOR_END]) / (STRESSOR_END - STRESSOR_START)
     stress_kubeattention = sum(kubeattention_p99[STRESSOR_START:STRESSOR_END]) / (STRESSOR_END - STRESSOR_START)
     print(f"During Stress (t={STRESSOR_START}-{STRESSOR_END}):")
-    print(f"  Default P99:       {stress_default:.2f}ms ← 📈 Spikes!")
-    print(f"  KubeAttention P99: {stress_kubeattention:.2f}ms ← ✅ Flat!")
+    print(f"  Default P99:       {stress_default:.2f}ms <- Spikes!")
+    print(f"  KubeAttention P99: {stress_kubeattention:.2f}ms <- Flat!")
     print()
     
     # Post-stress phase
@@ -138,7 +138,7 @@ def main():
         print("🎉 SUCCESS: KubeAttention latency stayed FLAT during stress!")
         print("   Pre-emption logic VERIFIED.")
     else:
-        print("⚠️  Latency not flat - check isolation")
+        print("Latency not flat - check isolation")
     
     # Save data for artifact
     data = {

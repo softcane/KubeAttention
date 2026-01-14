@@ -7,8 +7,9 @@ Pushes metrics to Prometheus Pushgateway for immediate visibility.
 """
 
 import time
+import os
 import random
-import requests
+
 from prometheus_client import (
     CollectorRegistry,
     Gauge,
@@ -18,6 +19,7 @@ from prometheus_client import (
 )
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
+from kubernetes import client, config
 
 # Create registry
 registry = CollectorRegistry()
@@ -68,12 +70,28 @@ brain_memory = Gauge(
     registry=registry,
 )
 
-NODES = ['kubeattention-worker', 'kubeattention-worker2', 'kubeattention-worker3']
+def get_nodes():
+    """Discover nodes dynamically from the Kubernetes API."""
+    try:
+        # Try in-cluster config first, then kube-config
+        try:
+            config.load_incluster_config()
+        except config.config_exception.ConfigException:
+            config.load_kube_config()
+            
+        v1 = client.CoreV1Api()
+        nodes = v1.list_node()
+        return [node.metadata.name for node in nodes.items if "control-plane" not in node.metadata.name]
+    except Exception as e:
+        # Fallback for local development if k8s is not available
+        return ["node-1", "node-2", "node-3"]
 
 def update_metrics():
     """Update metrics with realistic values."""
+    nodes = get_nodes()
+    
     # Brain latency per node
-    for node in NODES:
+    for node in nodes:
         latency = random.gauss(25, 8)  # 25ms avg, 8ms std
         latency = max(5, min(50, latency))  # Clamp to [5, 50]
         brain_latency.labels(node=node).set(latency)
@@ -93,7 +111,7 @@ def update_metrics():
     collector_outcomes.labels(outcome=outcome).inc()
     
     # Node scores
-    for node in NODES:
+    for node in nodes:
         score = random.gauss(60, 15)
         score = max(20, min(95, score))
         node_scores.labels(node=node).set(score)
@@ -120,12 +138,12 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
 def run_http_server(port=8080):
     server = HTTPServer(('0.0.0.0', port), MetricsHandler)
-    print(f'📊 Metrics server running on port {port}')
+    print(f'Metrics server running on port {port}')
     server.serve_forever()
 
 def push_loop(pushgateway_url: str, interval: float = 5.0):
     """Push metrics to Prometheus Pushgateway."""
-    print(f'📤 Pushing metrics to {pushgateway_url} every {interval}s')
+    print(f'Pushing metrics to {pushgateway_url} every {interval}s')
     
     while True:
         try:
@@ -133,7 +151,7 @@ def push_loop(pushgateway_url: str, interval: float = 5.0):
             push_to_gateway(pushgateway_url, job='kubeattention', registry=registry)
             print('.', end='', flush=True)
         except Exception as e:
-            print(f'\n⚠️ Push failed: {e}')
+            print(f'\nPush failed: {e}')
         
         time.sleep(interval)
 
@@ -148,3 +166,4 @@ if __name__ == '__main__':
     
     # Push metrics in main thread
     push_loop(pushgateway_url)
+
