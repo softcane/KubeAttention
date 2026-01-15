@@ -1,0 +1,7 @@
+{
+  "model_type": "mlp",
+  "num_samples": 100000,
+  "elapsed_seconds": 48.664109333010856,
+  "final_loss": 0.023281859006313608,
+  "epochs": 50
+}

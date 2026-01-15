@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class InferenceConfig:
     """Inference latency and safety constraints."""
-    MAX_LATENCY_MS: int = 45
+    MAX_LATENCY_MS: int = 500  # Increased for local Kind cluster testing
     FALLBACK_SCORE: int = 50
     FALLBACK_CONFIDENCE: float = 0.1
 
@@ -149,6 +149,43 @@ class DatasetConfig:
 
 
 @dataclass(frozen=True)
+class TrainingConfig:
+    """Policy weights for label generation and loss calculation."""
+    # Label Heuristics for "Goodness"
+    CPU_WEIGHT: float = 0.4
+    MEM_WEIGHT: float = 0.4
+    CACHE_WEIGHT: float = 0.2
+    
+    # Feedback Blend: how much to trust telemetry vs actual outcome
+    TELEMETRY_TRUST_FACTOR: float = 0.3
+    OUTCOME_TRUST_FACTOR: float = 0.7
+    
+    # Outcome Values (Target labels)
+    OUTCOME_LABELS: dict[str, float] = field(default_factory=lambda: {
+        "running": 1.0,      # Success
+        "restarted": 0.5,    # Partial success
+        "terminated": 0.3,   # Failure
+        "oom_killed": 0.0,   # Critical failure
+        "evicted": 0.0,      # Critical failure (noisy neighbor)
+        "failed": 0.0,       # Failure
+        "deleted": 0.5,      # Unknown (treat as neutral)
+        "unknown": 0.5,      # Unknown
+    })
+    
+    # Outcome weights for loss function (Safety Penalties)
+    OUTCOME_WEIGHTS: dict[str, float] = field(default_factory=lambda: {
+        "running": 1.0,
+        "restarted": 1.5,
+        "terminated": 2.0,
+        "oom_killed": 3.0,   # Penalize heavily
+        "evicted": 3.0,      # Penalize heavily
+        "failed": 2.0,
+        "deleted": 0.5,
+        "unknown": 0.5,
+    })
+
+
+@dataclass(frozen=True)
 class ModelSelectionConfig:
     """Model selection configuration."""
     # Model type: "mlp" or "xgboost"
@@ -169,3 +206,4 @@ REBALANCER = RebalancerConfig()
 CLUSTER = ClusterConfig()
 DATASET = DatasetConfig()
 MODEL_SELECTION = ModelSelectionConfig()
+TRAINING = TrainingConfig()

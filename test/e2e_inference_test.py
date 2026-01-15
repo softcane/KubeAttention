@@ -59,8 +59,20 @@ def main():
     
     print("Quick training on synthetic data...")
     train_X = np.random.rand(500, total_features).astype(np.float32)
-    # Give lower scores to high CPU utilization (col 0) and high contention (col 4: l3_miss)
-    train_y = (1.0 - train_X[:, 0] * 0.5 - train_X[:, 4] * 0.5).astype(np.float32)
+    
+    # Training labels: penalize factors that hurt scheduling quality
+    # Feature indices (from FEATURE_NAMES):
+    #   0: cpu_utilization  - high CPU = bad placement
+    #   4: l3_cache_miss_rate - high contention = bad placement  
+    #   12: node_cost_index - high cost = worse (prefer cheaper nodes)
+    #   14: spot_interruption_risk - high risk = worse for stable workloads
+    train_y = (
+        1.0 
+        - train_X[:, 0] * 0.3    # CPU penalty (30% weight)
+        - train_X[:, 4] * 0.3    # Cache contention penalty (30% weight)
+        - train_X[:, 12] * 0.25  # Cost penalty (25% weight) 
+        - train_X[:, 14] * 0.15  # Spot risk penalty (15% weight)
+    ).astype(np.float32)
     train_y = np.clip(train_y, 0, 1)
     
     metrics = model.train(train_X, train_y, epochs=30, batch_size=32)

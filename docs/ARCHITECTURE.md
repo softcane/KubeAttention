@@ -47,11 +47,11 @@ KubeAttention supports two scoring models, selectable via `brain/config.py`:
 ### MLP Architecture
 
 ```
-Input (20 features)
+Input (26 features: 15 node + 11 pod)
     |
     v
 +-------------------+
-| Linear(20 -> 64)  |
+| Linear(26 -> 64)  |
 | ReLU              |
 +-------------------+
     |
@@ -87,7 +87,7 @@ Input (20 features)
 
 ## Feature Set
 
-The Brain receives 15 eBPF-derived features plus 5 pod context features:
+The Brain receives 15 eBPF-derived node features plus 11 pod context features:
 
 ### Node Features (15)
 
@@ -109,15 +109,21 @@ The Brain receives 15 eBPF-derived features plus 5 pod context features:
 | spot_interruption_risk | metadata | Risk assessment |
 | zone_diversity_score | computed | Zone spread incentive |
 
-### Pod Context Features (5)
+### Pod Context Features (11)
 
 | Feature | Description |
 |---------|-------------|
-| cpu_normalized | Requested CPU / 4000m |
-| memory_normalized | Requested memory / 16GB |
-| workload_type | One-hot encoded (cpu/mem/io/balanced) |
-| criticality | Priority level (low/medium/high) |
-| priority | Scheduling priority weight |
+| cpu_normalized | Requested CPU / 8000m |
+| memory_normalized | Requested memory / 32GB |
+| workload_cpu_bound | One-hot: CPU-intensive workload |
+| workload_memory_bound | One-hot: Memory-intensive workload |
+| workload_io_bound | One-hot: I/O-intensive workload |
+| workload_balanced | One-hot: Balanced workload |
+| workload_unknown | One-hot: Unknown workload type |
+| criticality_unknown | One-hot: Unknown criticality |
+| criticality_low | One-hot: Low priority |
+| criticality_medium | One-hot: Medium priority |
+| criticality_high | One-hot: High/critical priority |
 
 ---
 
@@ -129,10 +135,10 @@ The Brain receives 15 eBPF-derived features plus 5 pod context features:
 # Node features: (N, 15) matrix for N candidate nodes
 node_features = extract_from_telemetry_cache(nodes)
 
-# Pod features: (5,) vector for the pod being scheduled
+# Pod features: (11,) vector for the pod being scheduled
 pod_features = encode_pod_context(pod)
 
-# Concatenate for model input: (N, 20)
+# Concatenate for model input: (N, 26)
 X = concatenate(node_features, broadcast(pod_features, N))
 ```
 
@@ -198,12 +204,19 @@ The key insight is that node scoring is primarily a tabular regression problem. 
 
 ### Data Collection
 
-Training data is collected via the Collector component watching scheduling events:
+Training data is collected via the Collector component watching scheduling events. The Collector fetches real-time CPU/memory metrics from the Kubernetes **metrics-server API** (`metrics.k8s.io/v1beta1`).
 
 ```python
 # Each training sample contains:
 {
-    "node_telemetry": {...},    # 15 features per node
+    "node_telemetry": {
+        "node-1": {
+            "cpu_utilization": 0.092,    # From metrics-server
+            "memory_utilization": 0.111, # From metrics-server
+            "l3_cache_miss_rate": 0.0,   # From Tetragon (when available)
+            ...
+        }
+    },
     "pod_context": {...},       # Pod requirements
     "chosen_node": "node-1",    # Where scheduler placed the pod
     "outcome": "running",       # running / oom_killed / evicted
@@ -238,6 +251,55 @@ model.save("checkpoints/best_model.pt")
 
 ---
 
+## Cost Function
+
+The training objective uses a **weighted Mean Squared Error (MSE)** loss that penalizes critical failures more heavily than successful placements.
+
+### Label Scoring Formula
+
+The target label for each node is a quantitative "goodness" score. These formulas are central to the KubeAttention policy and are **fully configurable** in `brain/config.py` under `TrainingConfig`.
+
+For each node, the baseline score is computed from telemetry:
+```
+label(node) = w_cpu × (1 - cpu_util) + w_mem × (1 - mem_util) + w_cache × (1 - l3_cache_miss)
+```
+*Default Weights: w_cpu=0.4, w_mem=0.4, w_cache=0.2*
+
+For the **chosen node** (where the pod was actually placed), the outcome is factored in using a "Trust Factor" blend:
+
+```
+label(chosen) = (1 - trust_outcome) × telemetry_score + trust_outcome × outcome_score
+```
+*Default Outcome Trust: 0.7*
+
+Where `outcome_score` maps real-world results to target values:
+
+| Outcome | Score | Weight | Rationale |
+|---------|-------|--------|-----------|
+| running | 1.0 | 1.0× | Successful placement |
+| restarted | 0.5 | 1.5× | Minor issue |
+| terminated | 0.3 | 2.0× | Failure |
+| oom_killed | 0.0 | 3.0× | Critical: noisy neighbor OOM |
+| evicted | 0.0 | 3.0× | Critical: resource contention |
+| failed | 0.0 | 2.0× | General failure |
+
+### Training Loss
+
+The weighted MSE loss is:
+
+```
+L = (1/N) × Σᵢ wᵢ × (ŷᵢ - yᵢ)²
+```
+
+Where:
+- `ŷᵢ` = predicted score for node i (0-1 range during training)
+- `yᵢ` = target label for node i
+- `wᵢ` = outcome weight (1.0-3.0×, from table above)
+
+This weighting scheme ensures the model learns aggressively from failures (OOM, eviction) while treating successful placements as baseline.
+
+---
+
 ## Performance Constraints
 
 | Constraint | Target | Implementation |
@@ -258,6 +320,29 @@ The Rebalancer runs as a background audit loop that identifies pods on sub-optim
 3. If current node scores below 40 AND an alternative is 20+ points better:
    - Annotates the pod with `kubeattention.io/rebalance-target`
    - External controller can use this annotation to trigger eviction
+
+### Verified E2E Results
+
+In our Kind cluster testing (January 2026), the Rebalancer successfully identified 4 pods for migration with score deltas of 33-34 points:
+
+```
+benchmark/http-echo-bcvr4          -> worker (delta: 33)
+benchmark/redis-latency-test-cc58n -> worker (delta: 34)
+benchmark/stress-membw-v2q2p       -> worker (delta: 33)
+kubeattention/collector-xsgqm      -> worker (delta: 33)
+```
+
+---
+
+## Model Loading
+
+The Brain server loads a pre-trained model on startup from:
+
+```
+/app/brain/models/trained_model.pt
+```
+
+If no model is found, the server uses random initialization and logs a warning. To bake a model into the Docker image, place it in `brain/models/trained_model.pt` before building.
 
 ---
 

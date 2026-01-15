@@ -1,0 +1,23 @@
+apiVersion: v2
+name: kubeattention
+description: ML-based Kubernetes scheduler for noisy neighbor avoidance
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - kubernetes
+  - scheduler
+  - machine-learning
+  - ebpf
+  - tetragon
+home: https://github.com/softcane/KubeAttention
+sources:
+  - https://github.com/softcane/KubeAttention
+maintainers:
+  - name: Pradeep Singh
+    email: pradeep@softcane.com
+dependencies:
+  - name: tetragon
+    version: ">=1.0.0"
+    repository: https://helm.cilium.io
+    condition: tetragon.enabled

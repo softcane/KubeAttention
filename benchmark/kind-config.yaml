@@ -18,32 +18,17 @@ nodes:
   # Worker nodes - simulate different "profiles"
   - role: worker
     labels:
-      kubeattention.io/profile: "noisy-1"
+      kubeattention.io/profile: "noisy-a"
       topology.kubernetes.io/zone: "zone-a"
   
   - role: worker
     labels:
-      kubeattention.io/profile: "quiet-1"
-      topology.kubernetes.io/zone: "zone-a"
-  
-  - role: worker
-    labels:
-      kubeattention.io/profile: "noisy-2"
+      kubeattention.io/profile: "quiet-b"
       topology.kubernetes.io/zone: "zone-b"
   
   - role: worker
     labels:
-      kubeattention.io/profile: "quiet-2"
-      topology.kubernetes.io/zone: "zone-b"
-  
-  - role: worker
-    labels:
-      kubeattention.io/profile: "mixed-1"
-      topology.kubernetes.io/zone: "zone-c"
-  
-  - role: worker
-    labels:
-      kubeattention.io/profile: "mixed-2"
+      kubeattention.io/profile: "mixed-c"
       topology.kubernetes.io/zone: "zone-c"
 
 # Resource limits for Kind nodes (prevents laptop overload)

@@ -23,8 +23,9 @@ COPY brain/ brain/
 # Create UDS socket directory
 RUN mkdir -p /var/run/kubeattention
 
-# Set Python path
+# Set Python path and unbuffer logs
 ENV PYTHONPATH=/app:/app/gen/python
+ENV PYTHONUNBUFFERED=1
 
 # Expose gRPC and metrics ports
 EXPOSE 50051 9090

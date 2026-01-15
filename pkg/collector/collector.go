@@ -22,26 +22,27 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 // SchedulingEvent represents a single scheduling decision with outcome
 type SchedulingEvent struct {
-	Timestamp         time.Time              `json:"timestamp"`
-	EventID           string                 `json:"event_id"`
-	PodUID            string                 `json:"pod_uid"`
-	PodName           string                 `json:"pod_name"`
-	PodNamespace      string                 `json:"pod_namespace"`
-	PodLabels         map[string]string      `json:"pod_labels"`
-	CPURequestMilli   int64                  `json:"cpu_request_milli"`
-	MemoryRequestBytes int64                 `json:"memory_request_bytes"`
-	CandidateNodes    []string               `json:"candidate_nodes"`
-	NodeTelemetry     map[string]NodeMetrics `json:"node_telemetry"`
-	ChosenNode        string                 `json:"chosen_node"`
-	SchedulerName     string                 `json:"scheduler_name"`
+	Timestamp          time.Time              `json:"timestamp"`
+	EventID            string                 `json:"event_id"`
+	PodUID             string                 `json:"pod_uid"`
+	PodName            string                 `json:"pod_name"`
+	PodNamespace       string                 `json:"pod_namespace"`
+	PodLabels          map[string]string      `json:"pod_labels"`
+	CPURequestMilli    int64                  `json:"cpu_request_milli"`
+	MemoryRequestBytes int64                  `json:"memory_request_bytes"`
+	CandidateNodes     []string               `json:"candidate_nodes"`
+	NodeTelemetry      map[string]NodeMetrics `json:"node_telemetry"`
+	ChosenNode         string                 `json:"chosen_node"`
+	SchedulerName      string                 `json:"scheduler_name"`
 	// Outcome fields - filled after 5 minutes
-	Outcome           string                 `json:"outcome"` // "running", "oom_killed", "evicted", "failed"
-	OutcomeTimestamp  time.Time              `json:"outcome_timestamp"`
-	P99LatencyMs      float64                `json:"p99_latency_ms"`
+	Outcome          string    `json:"outcome"` // "running", "oom_killed", "evicted", "failed"
+	OutcomeTimestamp time.Time `json:"outcome_timestamp"`
+	P99LatencyMs     float64   `json:"p99_latency_ms"`
 }
 
 // NodeMetrics represents telemetry snapshot at scheduling time
@@ -63,13 +64,15 @@ type NodeMetrics struct {
 
 // EventCollector watches scheduling events and collects training data
 type EventCollector struct {
-	client           kubernetes.Interface
-	outputPath       string
-	outcomeWaitTime  time.Duration
-	mu               sync.Mutex
-	pendingOutcomes  map[string]*SchedulingEvent // pod UID -> event
-	eventFile        *os.File
-	eventCount       int64
+	client          kubernetes.Interface
+	metricsClient   metricsv.Interface
+	restConfig      *rest.Config
+	outputPath      string
+	outcomeWaitTime time.Duration
+	mu              sync.Mutex
+	pendingOutcomes map[string]*SchedulingEvent // pod UID -> event
+	eventFile       *os.File
+	eventCount      int64
 }
 
 // NewEventCollector creates a collector that logs to JSONL file
@@ -89,10 +92,17 @@ func NewEventCollector(outputPath string) (*EventCollector, error) {
 		return nil, fmt.Errorf("failed to open output file: %w", err)
 	}
 
+	metricsClient, err := metricsv.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metrics client: %w", err)
+	}
+
 	return &EventCollector{
 		client:          client,
+		metricsClient:   metricsClient,
+		restConfig:      config,
 		outputPath:      outputPath,
-		outcomeWaitTime: 5 * time.Minute,
+		outcomeWaitTime: 30 * time.Second, // Reduced for faster data collection
 		pendingOutcomes: make(map[string]*SchedulingEvent),
 		eventFile:       file,
 	}, nil
@@ -191,7 +201,7 @@ func (c *EventCollector) recordSchedulingDecision(ctx context.Context, pod *core
 		c.eventCount, pod.Namespace, pod.Name, pod.Spec.NodeName)
 }
 
-// collectNodeTelemetry gets current telemetry for all nodes
+// collectNodeTelemetry gets current telemetry for all nodes from metrics-server
 func (c *EventCollector) collectNodeTelemetry(ctx context.Context) map[string]NodeMetrics {
 	nodes, err := c.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -199,13 +209,50 @@ func (c *EventCollector) collectNodeTelemetry(ctx context.Context) map[string]No
 	}
 
 	telemetry := make(map[string]NodeMetrics)
+
+	// Get node metrics from metrics-server using official client
+	nodeMetricsList, err := c.metricsClient.MetricsV1beta1().NodeMetricses().List(ctx, metav1.ListOptions{})
+
+	// Build lookup map
+	nodeMetricsMap := make(map[string]struct {
+		CPUNano  int64
+		MemBytes int64
+	})
+	if err == nil && nodeMetricsList != nil {
+		for _, item := range nodeMetricsList.Items {
+			nodeMetricsMap[item.Name] = struct {
+				CPUNano  int64
+				MemBytes int64
+			}{
+				CPUNano:  item.Usage.Cpu().MilliValue() * 1000000, // milli to nano
+				MemBytes: item.Usage.Memory().Value(),
+			}
+		}
+	}
+
 	for _, node := range nodes.Items {
-		// In production, call TetragonClient here
-		telemetry[node.Name] = NodeMetrics{
+		metrics := NodeMetrics{
 			NodeName:  node.Name,
 			Timestamp: time.Now(),
-			// Metrics would be populated from Tetragon
 		}
+
+		// Get allocatable resources for percentage calculation
+		allocCPU := node.Status.Allocatable.Cpu().MilliValue()
+		allocMem := node.Status.Allocatable.Memory().Value()
+
+		// Look up actual usage from metrics-server
+		if m, ok := nodeMetricsMap[node.Name]; ok {
+			// Calculate utilization percentages
+			if allocCPU > 0 {
+				cpuMilli := m.CPUNano / 1000000 // nano to milli
+				metrics.CPUUtilization = float64(cpuMilli) / float64(allocCPU)
+			}
+			if allocMem > 0 {
+				metrics.MemoryUtilization = float64(m.MemBytes) / float64(allocMem)
+			}
+		}
+
+		telemetry[node.Name] = metrics
 	}
 
 	return telemetry

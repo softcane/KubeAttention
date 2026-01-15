@@ -23,7 +23,7 @@ from brain.metrics_schema import FEATURE_NAMES
 
 # Input dimension: node features + pod context (5 features: cpu_norm, mem_norm, workload_type, criticality, priority)
 NODE_FEATURE_DIM = len(FEATURE_NAMES)
-POD_CONTEXT_DIM = 5
+POD_CONTEXT_DIM = 11
 DEFAULT_INPUT_DIM = NODE_FEATURE_DIM + POD_CONTEXT_DIM
 
 
