@@ -114,49 +114,37 @@ class Rebalancer:
         name = pod.metadata.name
         current_node = pod.spec.node_name
         
-        # 1. Collect resources
-        cpu_milli = 0
-        mem_bytes = 0
-        for container in pod.spec.containers:
-            # Simplified resource extraction
-            req = container.resources.requests or {}
-            # pod req parsing is complex in K8s, we use 1000m/1Gi fallback for audit
-            cpu_val = req.get('cpu', '1000m')
-            mem_val = req.get('memory', '1Gi')
-            # (Note: real parser would go here)
-            cpu_milli += 1000 # placeholder
-            mem_bytes += 1024*1024*1024 # placeholder
-            
-        # 2. Build pod context feature vector (5 features)
-        # [cpu_norm, mem_norm, workload_type_encoded, criticality_encoded, priority]
-        cpu_norm = min(cpu_milli / 4000.0, 1.0)  # Normalize to [0,1]
-        mem_norm = min(mem_bytes / (16 * 1024**3), 1.0)  # Normalize assuming 16GB max
-        criticality = pod.metadata.annotations.get("kubeattention.io/criticality", "unknown") if pod.metadata.annotations else "unknown"
-        crit_map = {"critical": 1.0, "high": 0.75, "medium": 0.5, "low": 0.25, "unknown": 0.5}
-        crit_val = crit_map.get(criticality, 0.5)
-        pod_features = np.array([cpu_norm, mem_norm, 0.5, crit_val, 0.5], dtype=np.float32)
+        # 2. Build pod context feature vector (Unified logic)
+        cpu_val = pod.spec.containers[0].resources.requests.get('cpu', '100m') if pod.spec.containers[0].resources.requests else '100m'
+        mem_val = pod.spec.containers[0].resources.requests.get('memory', '128Mi') if pod.spec.containers[0].resources.requests else '128Mi'
         
-        # 3. Extract node features from telemetry cache
+        # Simple string parsing for units
+        def parse_cpu(v):
+            if v.endswith('m'): return int(v[:-1])
+            return int(float(v) * 1000)
+        def parse_mem(v):
+            if v.endswith('Gi'): return int(float(v[:-2]) * 1024**3)
+            if v.endswith('Mi'): return int(float(v[:-2]) * 1024**2)
+            return int(v)
+
+        pod_ctx = PodContext(
+            pod_name=name,
+            pod_namespace=namespace,
+            cpu_milli=parse_cpu(cpu_val),
+            memory_bytes=parse_mem(mem_val),
+            workload_type="balanced", # Default for rebalancer audit
+        )
+        pod_features = np.array(pod_ctx.to_feature_vector(), dtype=np.float32)
+        
+        # 3. Extract node features from telemetry cache (Unified logic)
         candidate_nodes = list(self.telemetry_cache.keys())
         if current_node not in candidate_nodes:
             return None # Can't score current node
         
-        # Build node feature matrix from cached snapshots
-        node_features_list = []
-        for node_name in candidate_nodes:
-            snapshot = self.telemetry_cache[node_name]
-            # Extract features in FEATURE_NAMES order
-            features = []
-            for feat_name in FEATURE_NAMES:
-                val = getattr(snapshot, feat_name, 0.0)
-                if val is None:
-                    val = 0.0
-                features.append(float(val))
-            node_features_list.append(features)
-        
+        node_features_list = [self.telemetry_cache[node_name].to_feature_vector() for node_name in candidate_nodes]
         node_features = np.array(node_features_list, dtype=np.float32)
         
-        # 4. Run inference using new score_nodes interface
+        # 4. Run inference
         results = self.model.score_nodes(node_features, pod_features, candidate_nodes)
         
         # 5. Find current vs best

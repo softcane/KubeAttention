@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from brain.metrics_schema import FEATURE_NAMES, TETRAGON_METRICS_SCHEMA
 from brain.tensor_encoder import PodContext
-from brain.config import DATASET, CLUSTER
+from brain.config import DATASET, CLUSTER, TRAINING
 
 
 class SchedulingDataset(Dataset):
@@ -62,29 +62,9 @@ class SchedulingDataset(Dataset):
     # Feature names from metrics_schema.py (single source of truth)
     # DO NOT redefine here - import from metrics_schema to avoid mismatch!
     
-    # Outcome to label mapping
-    OUTCOME_LABELS = {
-        "running": 1.0,      # Success
-        "restarted": 0.5,    # Partial success
-        "terminated": 0.3,   # Failure
-        "oom_killed": 0.0,   # Critical failure
-        "evicted": 0.0,      # Critical failure (noisy neighbor)
-        "failed": 0.0,       # Failure
-        "deleted": 0.5,      # Unknown (treat as neutral)
-        "unknown": 0.5,      # Unknown
-    }
-    
-    # Outcome weights for loss function
-    OUTCOME_WEIGHTS = {
-        "running": 1.0,
-        "restarted": 1.5,
-        "terminated": 2.0,
-        "oom_killed": 3.0,   # Penalize heavily
-        "evicted": 3.0,      # Penalize heavily
-        "failed": 2.0,
-        "deleted": 0.5,
-        "unknown": 0.5,
-    }
+    # Outcome to label mapping and weights now managed in config.py
+    # Access via TRAINING.OUTCOME_LABELS and TRAINING.OUTCOME_WEIGHTS
+
     
     def __init__(
         self,
@@ -143,7 +123,8 @@ class SchedulingDataset(Dataset):
             for j, feature_name in enumerate(FEATURE_NAMES):
                 value = metrics.get(feature_name, 0.0)
                 # Normalize to [0, 1] range
-                node_features[i, 0, j] = self._normalize_feature(feature_name, value)
+                # Fill all temporal snapshots with current value for single-shot data
+                node_features[i, :, j] = self._normalize_feature(feature_name, value)
         
         # Build pod context using the shared PodContext class (Issue 10 fix: unify encoding)
         pod = PodContext(
@@ -165,35 +146,44 @@ class SchedulingDataset(Dataset):
         outcome = event.get("outcome", "unknown")
         outcome_score = self.OUTCOME_LABELS.get(outcome, 0.5)
         
-        # ============================================================================
-        # KNOWN ISSUE: Inverted Label Semantics
-        # ============================================================================
-        # This label construction has CRITICAL FLAWS:
-        #
-        # 1. Only the CHOSEN node gets a non-zero target. All other nodes get 0.0.
-        #    This means the model never learns what score competing nodes SHOULD have.
-        #
-        # 2. If outcome is "oom_killed" (score=0.0), the entire label vector is zeros.
-        #    The model cannot distinguish "all nodes are bad" from "OOM happened".
-        #
-        # 3. This is NOT a ranking signal. The model is trained to regress toward a
-        #    sparse target, which will push all outputs toward 0 to minimize MSE.
-        #
-        # RECOMMENDED FIX: Use CrossEntropyLoss with chosen_idx as target class,
-        # or implement a ListMLE/MarginRankingLoss for proper learning-to-rank.
-        # ============================================================================
-        
-        # Target: the chosen node gets the outcome score
+        # LABEL LOGIC IMPROVEMENT:
+        # Instead of sparse labels (only chosen node), we use the outcome score 
+        # as a baseline and then adjust other nodes based on their relative telemetry.
+        # This gives a much richer training signal.
         labels = np.zeros(self.max_nodes, dtype=np.float32)
-        if chosen_idx < self.max_nodes:
-            labels[chosen_idx] = outcome_score
+        
+        # Ground truth: nodes with better metrics should have higher scores
+        for i, node_name in enumerate(node_names):
+            metrics = node_telemetry[node_name]
+            # Heuristic calculation using config weights
+            cpu = metrics.get("cpu_utilization", 0.5)
+            mem = metrics.get("memory_utilization", 0.5)
+            cache = metrics.get("l3_cache_miss_rate", 0.1)
+            
+            # Score is in [0, 1]
+            node_score = (
+                (1.0 - cpu) * TRAINING.CPU_WEIGHT + 
+                (1.0 - mem) * TRAINING.MEM_WEIGHT + 
+                (1.0 - cache) * TRAINING.CACHE_WEIGHT
+            )
+            
+            # If this was the chosen node, factor in the ACTUAL outcome
+            if node_name == chosen_node:
+                # Weighted average of telemetry and outcome
+                node_score = (
+                    TRAINING.TELEMETRY_TRUST_FACTOR * node_score + 
+                    TRAINING.OUTCOME_TRUST_FACTOR * outcome_score
+                )
+            
+            labels[i] = node_score
         
         # Attention mask: 1 for real nodes, 0 for padding
         attention_mask = np.zeros(self.max_nodes, dtype=np.float32)
         attention_mask[:num_nodes] = 1.0
         
         # Sample weight based on outcome
-        weight = self.OUTCOME_WEIGHTS.get(outcome, 1.0)
+        # Sample weight based on outcome
+        weight = TRAINING.OUTCOME_WEIGHTS.get(outcome, 1.0)
         
         return {
             "node_features": torch.tensor(node_features, dtype=torch.float32),

@@ -1,0 +1,64 @@
+# Default values for KubeAttention Helm chart
+
+# Brain ML Server
+brain:
+  enabled: true
+  replicas: 1
+  image:
+    repository: kubeattention/brain
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+  modelType: "mlp"  # or "xgboost"
+
+# Event Collector
+collector:
+  enabled: true
+  replicas: 1
+  outcomeWaitSeconds: 300
+  outputPath: "/data/events.jsonl"
+
+# Scheduler Plugin (requires building custom scheduler image)
+scheduler:
+  enabled: false  # Enable when custom scheduler image is ready
+  image:
+    repository: kubeattention/scheduler
+    tag: latest
+  shadowMode: true  # Safe rollout mode
+  fallbackScore: 50
+  timeoutMs: 45
+
+# Tetragon eBPF (dependency)
+tetragon:
+  enabled: true
+  export:
+    enabled: true
+    filename: /var/log/tetragon/tetragon.log
+
+# Proactive Rebalancer
+rebalancer:
+  enabled: true
+  intervalSeconds: 60
+  minSourceScore: 40
+  scoreDeltaThreshold: 20
+  maxPodsPerRun: 10
+  excludeNamespaces:
+    - kube-system
+    - kubeattention
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 50051
+
+# Persistence for training data
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""  # Use default

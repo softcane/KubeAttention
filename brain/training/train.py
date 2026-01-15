@@ -123,9 +123,9 @@ def train_model(
     # Initialize model with correct input dimension
     input_dim = X_train.shape[1]
     if model_type == "mlp":
-        model = get_model(model_type, input_dim=input_dim, **kwargs)
+        model = get_model(model_type, input_dim=input_dim, hidden_dim=kwargs.get("hidden_dim", 64))
     else:
-        model = get_model(model_type, **kwargs)
+        model = get_model(model_type, n_estimators=kwargs.get("n_estimators", 100), max_depth=kwargs.get("max_depth", 6))
     print(f"  Model: {model.name}")
     print(f"  Parameters: {model.num_parameters:,}")
     print(f"  Input dim: {input_dim}")

@@ -1,0 +1,25 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.agent/
+node_modules/
+dist/
+build/
+.ipynb_checkpoints/
+*.parquet
+*.jsonl
+*.png
+docs/
+# brain/models/*.pt
+# brain/models/*.json
+pkg/scheduler/bin/
+test/bin/

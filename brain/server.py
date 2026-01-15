@@ -61,8 +61,20 @@ class BrainServicer:
         model: Optional[BaseScorer] = None,
         encoder: Optional[ClusterTensorEncoder] = None,
         model_version: str = "v0.2.0",
+        model_path: Optional[str] = "/app/brain/models/trained_model.pt",
     ):
         self.model = model or get_model(MODEL_SELECTION.MODEL_TYPE)
+        
+        # Load trained model if available (Issue 4 fix)
+        if model_path and os.path.exists(model_path):
+            try:
+                self.model.load(model_path)
+                print(f"Brain: Successfully loaded model from {model_path}")
+            except Exception as e:
+                print(f"Brain: Failed to load model from {model_path}: {e}")
+        else:
+            print(f"Brain: No model found at {model_path}, using random initialization")
+            
         self.encoder = encoder or ClusterTensorEncoder()
         self.model_version = model_version
         self.last_latency_ms = 0
@@ -91,30 +103,33 @@ class BrainServicer:
                         confidence=INFERENCE.FALLBACK_CONFIDENCE,
                     )
             
-            # Extract node snapshot
-            if request.node_telemetry.node_name:
+            # Unified feature extraction using snapshots (handles normalization)
+            if hasattr(request, 'node_telemetry') and request.node_telemetry.node_name:
                 snapshot = NodeMetricsSnapshot.from_proto(request.node_telemetry)
             else:
+                # Fallback for legacy requests
                 snapshot = NodeMetricsSnapshot(
-                    node_name=request.node_name,
+                    node_name=request.node_name or "unknown",
                     cpu_utilization=request.telemetry.get("cpu_utilization", 0.5),
                     memory_utilization=request.telemetry.get("memory_utilization", 0.5),
                 )
             
-            # Convert snapshot to numpy feature array
-            from .metrics_schema import FEATURE_NAMES
-            import numpy as np
+            node_features = np.array([snapshot.to_feature_vector()], dtype=np.float32)
             
-            node_features = []
-            for feat_name in FEATURE_NAMES:
-                val = getattr(snapshot, feat_name, 0.0)
-                node_features.append(float(val) if val is not None else 0.0)
-            node_features = np.array([node_features], dtype=np.float32)
-            
-            # Build pod context features
-            pod_cpu_norm = min(request.pod_requirements.cpu_milli / 4000.0, 1.0) if hasattr(request, 'pod_requirements') else 0.25
-            pod_mem_norm = min(request.pod_requirements.memory_bytes / (16 * 1024**3), 1.0) if hasattr(request, 'pod_requirements') else 0.25
-            pod_features = np.array([pod_cpu_norm, pod_mem_norm, 0.5, 0.5, 0.5], dtype=np.float32)
+            # Unified pod feature extraction
+            if hasattr(request, 'pod_requirements'):
+                pod = PodContext(
+                    pod_name=request.pod_requirements.pod_name,
+                    pod_namespace=request.pod_requirements.pod_namespace,
+                    cpu_milli=request.pod_requirements.cpu_milli,
+                    memory_bytes=request.pod_requirements.memory_bytes,
+                    workload_type=request.pod_requirements.workload_type or "unknown",
+                    criticality="unknown", # Default
+                )
+            else:
+                pod = PodContext(pod_name="unknown", pod_namespace="unknown", cpu_milli=1000, memory_bytes=1024**3)
+                
+            pod_features = np.array(pod.to_feature_vector(), dtype=np.float32)
             
             # Run model inference using new score_nodes interface
             results = self.model.score_nodes(node_features, pod_features, [snapshot.node_name])
@@ -176,20 +191,20 @@ class BrainServicer:
                 # Update cache for proactive rebalancing
                 self.last_telemetry_cache[node.node_name] = snap
                 node_names.append(node.node_name)
-                
-                # Extract features
-                features = []
-                for feat_name in FEATURE_NAMES:
-                    val = getattr(snap, feat_name, 0.0)
-                    features.append(float(val) if val is not None else 0.0)
-                node_features_list.append(features)
+                node_features_list.append(snap.to_feature_vector())
             
             node_features = np.array(node_features_list, dtype=np.float32)
             
-            # Build pod context features
-            pod_cpu_norm = min(request.pod_requirements.cpu_milli / 4000.0, 1.0)
-            pod_mem_norm = min(request.pod_requirements.memory_bytes / (16 * 1024**3), 1.0)
-            pod_features = np.array([pod_cpu_norm, pod_mem_norm, 0.5, 0.5, 0.5], dtype=np.float32)
+            # Build pod context using shared logic
+            pod = PodContext(
+                pod_name=request.pod_requirements.pod_name,
+                pod_namespace=request.pod_requirements.pod_namespace,
+                cpu_milli=request.pod_requirements.cpu_milli,
+                memory_bytes=request.pod_requirements.memory_bytes,
+                workload_type=request.pod_requirements.workload_type or "unknown",
+                criticality="unknown",
+            )
+            pod_features = np.array(pod.to_feature_vector(), dtype=np.float32)
             
             # Run model inference using new score_nodes interface
             results = self.model.score_nodes(node_features, pod_features, node_names)

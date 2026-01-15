@@ -60,7 +60,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: brain
-          image: kubeattention-brain:latest
+          image: kubeattention/brain:latest
           imagePullPolicy: Never  # Use local image from Kind
           ports:
             - containerPort: 50051
