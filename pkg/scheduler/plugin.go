@@ -97,7 +97,7 @@ func New(obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 
 	// Create Singleton Tetragon Client
 	tetragon := NewTetragonClient("", "")
-	
+
 	// Create Telemetry Store for background collection
 	telemetryStore := NewTelemetryStore(tetragon, 1*time.Second)
 
@@ -112,10 +112,10 @@ func New(obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout*10)
 		defer cancel()
 		_ = client.Connect(ctx)
-		
+
 		// Start background telemetry collection for all nodes
 		// In a real K8s plugin, we would use an informer to get the list of nodes
-		// For now, we start with nil and let updateAll handle dynamic discovery or 
+		// For now, we start with nil and let updateAll handle dynamic discovery or
 		// wait for first PreScore to populate node list.
 		telemetryStore.Start(context.Background(), nil)
 	}()
@@ -250,7 +250,7 @@ func (ka *KubeAttention) ScoreExtensions() framework.ScoreExtensions {
 // collectNodeTelemetryFallback gathers basic K8s metrics when TelemetryStore is not yet populated.
 // NO external network calls are allowed here.
 func (ka *KubeAttention) collectNodeTelemetryFallback(node *v1.Node) map[string]float64 {
-	// eBPF metrics set to 0 (default fallback)
+	// All 15 eBPF metrics must be present to match Python model's FEATURE_NAMES
 	return map[string]float64{
 		"cpu_utilization":        0.5, // Conservative estimate
 		"memory_utilization":     0.5,
@@ -263,6 +263,10 @@ func (ka *KubeAttention) collectNodeTelemetryFallback(node *v1.Node) map[string]
 		"disk_iops":              0.0,
 		"network_rx_packets_sec": 0.0,
 		"network_tx_packets_sec": 0.0,
+		"node_cost_index":        0.1, // Default cost index
+		"zone_diversity_score":   0.5, // Neutral zone score
+		"spot_interruption_risk": 0.0, // Assume on-demand by default
+		"is_spot_instance":       0.0, // Boolean: not spot
 	}
 }
 
@@ -387,4 +391,3 @@ func (ka *KubeAttention) PreEnqueue(ctx context.Context, pod *v1.Pod) *framework
 
 	return framework.NewStatus(framework.Success)
 }
-

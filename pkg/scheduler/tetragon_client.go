@@ -33,19 +33,19 @@ type TetragonClient struct {
 
 // NodeMetrics holds real telemetry from Tetragon eBPF probes
 type NodeMetrics struct {
-	NodeName             string    `json:"node_name"`
-	Timestamp            time.Time `json:"timestamp"`
-	CPUUtilization       float64   `json:"cpu_utilization"`
-	CPUThrottleRate      float64   `json:"cpu_throttle_rate"`
-	MemoryUtilization    float64   `json:"memory_utilization"`
-	MemoryBandwidthGbps  float64   `json:"memory_bandwidth_gbps"`
-	L3CacheMissRate      float64   `json:"l3_cache_miss_rate"`
-	L3CacheOccupancyMB   float64   `json:"l3_cache_occupancy_mb"`
-	DiskIOWaitMs         float64   `json:"disk_io_wait_ms"`
-	DiskIOPS             float64   `json:"disk_iops"`
-	NetworkRxPacketsSec  float64   `json:"network_rx_packets_sec"`
-	NetworkTxPacketsSec  float64   `json:"network_tx_packets_sec"`
-	NetworkDropRate      float64   `json:"network_drop_rate"`
+	NodeName            string    `json:"node_name"`
+	Timestamp           time.Time `json:"timestamp"`
+	CPUUtilization      float64   `json:"cpu_utilization"`
+	CPUThrottleRate     float64   `json:"cpu_throttle_rate"`
+	MemoryUtilization   float64   `json:"memory_utilization"`
+	MemoryBandwidthGbps float64   `json:"memory_bandwidth_gbps"`
+	L3CacheMissRate     float64   `json:"l3_cache_miss_rate"`
+	L3CacheOccupancyMB  float64   `json:"l3_cache_occupancy_mb"`
+	DiskIOWaitMs        float64   `json:"disk_io_wait_ms"`
+	DiskIOPS            float64   `json:"disk_iops"`
+	NetworkRxPacketsSec float64   `json:"network_rx_packets_sec"`
+	NetworkTxPacketsSec float64   `json:"network_tx_packets_sec"`
+	NetworkDropRate     float64   `json:"network_drop_rate"`
 }
 
 // NewTetragonClient creates a client for fetching real metrics
@@ -89,12 +89,12 @@ func (c *TetragonClient) GetNodeMetrics(ctx context.Context, nodeName string) (*
 func (c *TetragonClient) fetchFromTetragon(ctx context.Context, nodeName string) (*NodeMetrics, error) {
 	// Tetragon exposes metrics at http://localhost:2112/metrics in Prometheus format
 	// These include perf counters for cache misses, memory bandwidth, etc.
-	req, err := http.NewRequestWithContext(ctx, "GET", 
+	req, err := http.NewRequestWithContext(ctx, "GET",
 		fmt.Sprintf("http://%s/metrics", c.tetragonEndpoint), nil)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("tetragon not reachable: %w", err)
@@ -117,12 +117,12 @@ func (c *TetragonClient) fetchFromTetragon(ctx context.Context, nodeName string)
 	}
 
 	metricsStr := string(body)
-	
+
 	// Parse Tetragon-specific eBPF metrics
-	// tetragon_events_total{type="PROCESS_EXEC"} 
+	// tetragon_events_total{type="PROCESS_EXEC"}
 	// tetragon_policy_events{action="allow"}
 	// tetragon_perf_event_cache_misses - L3 cache misses from perf counters
-	
+
 	metrics.L3CacheMissRate = parsePrometheusMetric(metricsStr, "tetragon_perf_event_cache_misses")
 	metrics.L3CacheOccupancyMB = parsePrometheusMetric(metricsStr, "tetragon_perf_event_llc_occupancy") / (1024 * 1024)
 	metrics.MemoryBandwidthGbps = parsePrometheusMetric(metricsStr, "tetragon_perf_event_memory_bandwidth") / 1e9
@@ -162,11 +162,11 @@ func (c *TetragonClient) fetchFromPrometheus(ctx context.Context, nodeName strin
 
 	// Query Prometheus for each metric
 	queries := map[string]*float64{
-		"node_cpu_seconds_total":                     &metrics.CPUUtilization,
-		"node_memory_MemTotal_bytes":                 &metrics.MemoryUtilization,
-		"node_disk_io_time_seconds_total":            &metrics.DiskIOWaitMs,
-		"node_network_receive_packets_total":         &metrics.NetworkRxPacketsSec,
-		"node_network_transmit_packets_total":        &metrics.NetworkTxPacketsSec,
+		"node_cpu_seconds_total":              &metrics.CPUUtilization,
+		"node_memory_MemTotal_bytes":          &metrics.MemoryUtilization,
+		"node_disk_io_time_seconds_total":     &metrics.DiskIOWaitMs,
+		"node_network_receive_packets_total":  &metrics.NetworkRxPacketsSec,
+		"node_network_transmit_packets_total": &metrics.NetworkTxPacketsSec,
 	}
 
 	for query, target := range queries {
@@ -178,9 +178,9 @@ func (c *TetragonClient) fetchFromPrometheus(ctx context.Context, nodeName strin
 
 	// eBPF-specific metrics not available in Prometheus
 	// Set to 0 with a flag indicating "estimated"
-	metrics.L3CacheMissRate = 0.0      // Not available without eBPF
-	metrics.L3CacheOccupancyMB = 0.0   // Not available without eBPF
-	metrics.MemoryBandwidthGbps = 0.0  // Not available without eBPF
+	metrics.L3CacheMissRate = 0.0     // Not available without eBPF
+	metrics.L3CacheOccupancyMB = 0.0  // Not available without eBPF
+	metrics.MemoryBandwidthGbps = 0.0 // Not available without eBPF
 
 	return metrics, nil
 }
@@ -231,6 +231,7 @@ func (c *TetragonClient) queryPrometheus(ctx context.Context, metric, nodeName s
 }
 
 // ToTelemetryMap converts NodeMetrics to the map format expected by BrainClient
+// IMPORTANT: Must include all 15 metrics to match Python model's FEATURE_NAMES
 func (m *NodeMetrics) ToTelemetryMap() map[string]float64 {
 	return map[string]float64{
 		"cpu_utilization":        m.CPUUtilization,
@@ -244,6 +245,11 @@ func (m *NodeMetrics) ToTelemetryMap() map[string]float64 {
 		"network_rx_packets_sec": m.NetworkRxPacketsSec,
 		"network_tx_packets_sec": m.NetworkTxPacketsSec,
 		"network_drop_rate":      m.NetworkDropRate,
+		// Cost/resilience metrics - default values for now
+		"node_cost_index":        0.1, // Default cost index
+		"zone_diversity_score":   0.5, // Neutral zone score
+		"spot_interruption_risk": 0.0, // Assume on-demand by default
+		"is_spot_instance":       0.0, // Boolean: not spot
 	}
 }
 

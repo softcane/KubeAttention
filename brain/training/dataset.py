@@ -144,7 +144,7 @@ class SchedulingDataset(Dataset):
         
         # Create binary labels for all nodes based on outcome
         outcome = event.get("outcome", "unknown")
-        outcome_score = self.OUTCOME_LABELS.get(outcome, 0.5)
+        outcome_score = TRAINING.OUTCOME_LABELS.get(outcome, 0.5)
         
         # LABEL LOGIC IMPROVEMENT:
         # Instead of sparse labels (only chosen node), we use the outcome score 

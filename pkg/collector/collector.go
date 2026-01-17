@@ -46,6 +46,7 @@ type SchedulingEvent struct {
 }
 
 // NodeMetrics represents telemetry snapshot at scheduling time
+// IMPORTANT: Must include all 15 metrics to match Python model's FEATURE_NAMES
 type NodeMetrics struct {
 	NodeName            string    `json:"node_name"`
 	Timestamp           time.Time `json:"timestamp"`
@@ -60,6 +61,11 @@ type NodeMetrics struct {
 	NetworkTxPacketsSec float64   `json:"network_tx_packets_sec"`
 	NetworkDropRate     float64   `json:"network_drop_rate"`
 	CPUThrottleRate     float64   `json:"cpu_throttle_rate"`
+	// Cost/resilience metrics (Phase 2 & 4)
+	NodeCostIndex        float64 `json:"node_cost_index"`
+	ZoneDiversityScore   float64 `json:"zone_diversity_score"`
+	SpotInterruptionRisk float64 `json:"spot_interruption_risk"`
+	IsSpotInstance       float64 `json:"is_spot_instance"`
 }
 
 // EventCollector watches scheduling events and collects training data
@@ -234,6 +240,11 @@ func (c *EventCollector) collectNodeTelemetry(ctx context.Context) map[string]No
 		metrics := NodeMetrics{
 			NodeName:  node.Name,
 			Timestamp: time.Now(),
+			// Cost/resilience defaults (Phase 2 & 4)
+			NodeCostIndex:        0.1, // Default cost index
+			ZoneDiversityScore:   0.5, // Neutral zone score
+			SpotInterruptionRisk: 0.0, // Assume on-demand
+			IsSpotInstance:       0.0, // Boolean: not spot
 		}
 
 		// Get allocatable resources for percentage calculation
