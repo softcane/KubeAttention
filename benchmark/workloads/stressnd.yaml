@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stress-nd
+  namespace: benchmark
+  labels:
+    app: stress-nd
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stress-nd
+  template:
+    metadata:
+      labels:
+        app: stress-nd
+    spec:
+      containers:
+      - name: stress-nd
+        image: polinux/stress
+        command: ["stress"]
+        args:
+        - "--cpu"
+        - "1"
+        - "--io"
+        - "1"
+        - "--vm"
+        - "1"
+        - "--vm-bytes"
+        - "256M"
+        - "--timeout"
+        - "3600s"
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
