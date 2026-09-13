@@ -40,20 +40,6 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the feature and RPC contracts.
 
 ---
 
-## Current validation
-
-The source and deployment repair was exercised on Kubernetes 1.35:
-
-- The scheduler executable started, acquired its leader lease, recovered from an initial Brain connection failure, and bound pods through the `kubeattention-scheduler` profile.
-- Shadow mode wrote a neutral recommendation annotation without changing placement. Active mode issued a successful Brain scoring RPC.
-- Metrics Server reported real node utilization. Controlled stress raised the designated worker to 47% CPU while the other workers remained at 0–1%.
-- The Collector wrote measured candidate-node records to its PVC and retained them across pod replacement.
-- Go tests, Python contract tests, image builds, and Helm lint passed.
-
-The measured Redis comparison issued 40,000 requests per scheduler. Worst per-pod P99 was `0.087 ms` for both the default scheduler and KubeAttention: **0% measured improvement**. This is valid integration evidence, not evidence that the current smoke checkpoint avoids noisy neighbors. Do not claim a latency win until a promoted model beats the held-out non-ML baseline and a repeated A/B run confirms it.
-
----
-
 ## Getting started
 
 ### Prerequisites
@@ -72,21 +58,15 @@ docker build -t kubeattention/brain:latest -f deploy/brain.Dockerfile .
 docker build -t kubeattention/collector:latest -f deploy/collector.Dockerfile .
 ```
 
-The Brain image installs the CPU-only PyTorch wheel. Its compressed image is about 652 MB on arm64 instead of 3.46 GB with the CUDA dependency set.
-
 ### Run the Kind acceptance path
 
 ```bash
 bash scripts/e2e-kind-full.sh
 ```
 
-The script creates a disposable Kind cluster, builds all three images, installs Metrics Server, loads a schema-compatible smoke checkpoint, deploys the chart, checks scheduler and Collector behavior, and runs the measured Redis comparison. The smoke checkpoint validates integration; it is not a production model and the script does not claim a latency improvement.
-
 Set `KEEP_CLUSTER=1` to retain the cluster for inspection.
 
 ### Deploy the Helm chart
-
-The Brain deliberately stays unready without a compatible checkpoint at `/models/best_model.pt`. Put a promoted MLP checkpoint in the `kubeattention-models` PVC before enabling the Brain and scheduler. Then install in shadow mode:
 
 ```bash
 helm upgrade --install kubeattention helm/kubeattention \
