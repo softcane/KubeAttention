@@ -12,6 +12,7 @@ spec:
   selector:
     matchLabels:
       app: collector
+      app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
@@ -26,16 +27,33 @@ spec:
           image: "{{ .Values.collector.image.repository }}:{{ .Values.collector.image.tag }}"
           imagePullPolicy: {{ .Values.collector.image.pullPolicy }}
           command:
-            - /collector
+            - /app/collector
+          args:
             - --output
             - {{ .Values.collector.outputPath }}
             - --outcome-wait
             - "{{ .Values.collector.outcomeWaitMinutes }}m"
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.collector.resources | nindent 12 }}
           volumeMounts:
             - name: training-data
               mountPath: /data
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -w /data"]
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -w /data"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -w /data"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
       volumes:
         - name: training-data
           persistentVolumeClaim:

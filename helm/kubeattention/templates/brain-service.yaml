@@ -1,0 +1,25 @@
+{{- if .Values.brain.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kubeattention.fullname" . }}-brain
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: brain
+    {{- include "kubeattention.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: brain
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: grpc
+      port: {{ .Values.brain.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+    {{- if .Values.brain.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.brain.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}
+{{- end }}

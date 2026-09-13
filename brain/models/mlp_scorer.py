@@ -15,55 +15,31 @@ import torch.nn.functional as F
 from .base import BaseScorer, ScoringResult, generate_reasoning
 from . import register_model
 
-# Dynamic feature count from schema
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from brain.metrics_schema import FEATURE_NAMES
+from brain.metrics_schema import (
+    FEATURE_SCHEMA_VERSION,
+    MODEL_INPUT_DIM,
+    MODEL_INPUT_NAMES,
+)
 
-# Input dimension: node features + pod context (5 features: cpu_norm, mem_norm, workload_type, criticality, priority)
-NODE_FEATURE_DIM = len(FEATURE_NAMES)
-POD_CONTEXT_DIM = 11
-DEFAULT_INPUT_DIM = NODE_FEATURE_DIM + POD_CONTEXT_DIM
+DEFAULT_INPUT_DIM = MODEL_INPUT_DIM
 
 
 class MLPNetwork(nn.Module):
-    """Simple 2-layer MLP for scoring."""
-    
+    """Two-layer regressor for absolute node quality."""
+
     def __init__(self, input_dim: int = DEFAULT_INPUT_DIM, hidden_dim: int = 64):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.score_head = nn.Linear(hidden_dim // 2, 1)
-        self.confidence_head = nn.Linear(hidden_dim // 2, 1)
-        
-    def forward(self, x: torch.Tensor, scale_to_100: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass.
-        
-        Args:
-            x: (N, F) input features
-            scale_to_100: If True, output scores in [0, 100]. If False, output in [0, 1].
-            
-        Returns:
-            scores: (N,) node scores in [0, 100] or [0, 1]
-            confidences: (N,) confidence in [0, 1]
-        """
+
+    def forward(self, x: torch.Tensor, scale_to_100: bool = True) -> torch.Tensor:
         h = F.relu(self.fc1(x))
         h = F.relu(self.fc2(h))
-        
-        # Raw sigmoid output in [0, 1]
-        raw_scores = torch.sigmoid(self.score_head(h))
-        
-        # Scale to [0, 100] only if requested (inference mode)
+        scores = torch.sigmoid(self.score_head(h))
         if scale_to_100:
-            scores = raw_scores * 100
-        else:
-            scores = raw_scores
-            
-        confidences = torch.sigmoid(self.confidence_head(h))  # [0, 1]
-        
-        return scores.squeeze(-1), confidences.squeeze(-1)
+            scores = scores * 100
+        return scores.squeeze(-1)
 
 
 
@@ -87,12 +63,14 @@ class MLPScorer(BaseScorer):
         hidden_dim: int = 64,
         device: str = "cpu",
     ):
+        if input_dim != MODEL_INPUT_DIM:
+            raise ValueError(f"input_dim {input_dim} does not match schema dimension {MODEL_INPUT_DIM}")
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.device = torch.device(device)
-        
         self.model = MLPNetwork(input_dim, hidden_dim).to(self.device)
         self.optimizer = None
+        self._is_trained = False
         
     @property
     def name(self) -> str:
@@ -101,6 +79,20 @@ class MLPScorer(BaseScorer):
     @property
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.model.parameters())
+
+    @property
+    def ready(self) -> bool:
+        return self._is_trained
+
+    def predict_quality(self, features: np.ndarray) -> np.ndarray:
+        if not self._is_trained:
+            raise ValueError("model is not trained")
+        if features.ndim != 2 or features.shape[1] != MODEL_INPUT_DIM:
+            raise ValueError(f"features must have shape (N, {MODEL_INPUT_DIM})")
+        self.model.eval()
+        inputs = torch.tensor(features, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            return self.model(inputs, scale_to_100=False).cpu().numpy()
     
     def score_nodes(
         self,
@@ -108,40 +100,31 @@ class MLPScorer(BaseScorer):
         pod_features: np.ndarray,
         node_names: List[str],
     ) -> List[ScoringResult]:
-        """Score all candidate nodes."""
+        """Return absolute node-quality scores using the loaded model."""
+        if not self._is_trained:
+            return [
+                ScoringResult(name, 50, f"Model not trained, using neutral score for {name}")
+                for name in node_names
+            ]
         self.model.eval()
-        
-        # Concatenate node features with pod context (broadcast pod to all nodes)
-        N = node_features.shape[0]
-        
-        # Ensure pod_features is 2D: (N, P)
-        if pod_features is not None and len(pod_features) > 0:
-            if len(pod_features.shape) == 1:
-                pod_broadcast = np.tile(pod_features, (N, 1))
-            else:
-                pod_broadcast = pod_features
-            # Concatenate: [node_features | pod_features]
-            X_combined = np.hstack([node_features, pod_broadcast])
-        else:
-            X_combined = node_features
-        
-        X = torch.tensor(X_combined, dtype=torch.float32, device=self.device)
-        
-        with torch.no_grad():
-            scores, confidences = self.model(X)
-        
-        results = []
-        for i, node_name in enumerate(node_names):
-            score = int(scores[i].item())
-            conf = float(confidences[i].item())
-            results.append(ScoringResult(
-                node_name=node_name,
-                score=score,
-                confidence=conf,
-                reasoning=generate_reasoning(node_name, score, node_features[i]),
-            ))
-        
-        return results
+        node_count = node_features.shape[0]
+        if pod_features is None or pod_features.ndim != 1:
+            raise ValueError("pod_features must be a one-dimensional feature vector")
+        pod_broadcast = np.broadcast_to(pod_features, (node_count, pod_features.shape[0]))
+        combined = np.hstack([node_features, pod_broadcast])
+        if combined.shape[1] != MODEL_INPUT_DIM:
+            raise ValueError(
+                f"model input has {combined.shape[1]} features, expected {MODEL_INPUT_DIM}"
+            )
+        scores = self.predict_quality(combined) * 100.0
+        return [
+            ScoringResult(
+                node_name=name,
+                score=int(np.clip(scores[index], 0, 100)),
+                reasoning=generate_reasoning(name, int(scores[index]), node_features[index]),
+            )
+            for index, name in enumerate(node_names)
+        ]
 
     
     def train(
@@ -176,8 +159,7 @@ class MLPScorer(BaseScorer):
             for batch_X, batch_y, batch_w in loader:
                 self.optimizer.zero_grad()
                 
-                # Use scale_to_100=False to get raw [0,1] output for training
-                scores, _ = self.model(batch_X, scale_to_100=False)
+                scores = self.model(batch_X, scale_to_100=False)
                 
                 # Loss: scores are [0,1], labels are [0,1] - direct comparison
                 loss = (batch_w * (scores - batch_y) ** 2).mean()
@@ -187,6 +169,8 @@ class MLPScorer(BaseScorer):
                 epoch_loss += loss.item()
             
             losses.append(epoch_loss / len(loader))
+
+        self._is_trained = True
         
         return {
             "final_loss": losses[-1],
@@ -196,18 +180,27 @@ class MLPScorer(BaseScorer):
 
     
     def save(self, path: str) -> None:
-        """Save model to disk."""
+        if not self._is_trained:
+            raise ValueError("Model not trained yet")
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save({
             "model_state_dict": self.model.state_dict(),
             "input_dim": self.input_dim,
             "hidden_dim": self.hidden_dim,
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "model_input_names": MODEL_INPUT_NAMES,
         }, path)
-    
+
     def load(self, path: str) -> None:
-        """Load model from disk."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.input_dim = checkpoint.get("input_dim", self.input_dim)
-        self.hidden_dim = checkpoint.get("hidden_dim", self.hidden_dim)
+        if checkpoint.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
+            raise ValueError("checkpoint feature schema is missing or incompatible")
+        if tuple(checkpoint.get("model_input_names", ())) != MODEL_INPUT_NAMES:
+            raise ValueError("checkpoint feature order is incompatible")
+        if checkpoint.get("input_dim") != MODEL_INPUT_DIM:
+            raise ValueError("checkpoint input dimension is incompatible")
+        self.input_dim = MODEL_INPUT_DIM
+        self.hidden_dim = checkpoint["hidden_dim"]
         self.model = MLPNetwork(self.input_dim, self.hidden_dim).to(self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
+        self._is_trained = True

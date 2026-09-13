@@ -1,23 +1,14 @@
-# Collector Service Dockerfile
-FROM golang:alpine AS builder
+FROM golang:1.25-alpine AS builder
 
-WORKDIR /app
-
-# Install git for dependencies
-RUN apk add --no-cache git
-
-# Copy go mod files
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-
-# Copy source code
 COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/collector ./cmd/collector
 
-# Build collector
-RUN go build -o collector ./cmd/collector/main.go
-
-# Final stage
-FROM alpine:3.19
+FROM alpine:3.22
+RUN addgroup -g 1000 collector && adduser -D -u 1000 -G collector collector
 WORKDIR /app
-COPY --from=builder /app/collector /app/collector
+COPY --from=builder /out/collector /app/collector
+USER collector
 ENTRYPOINT ["/app/collector"]

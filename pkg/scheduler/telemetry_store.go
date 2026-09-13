@@ -4,40 +4,47 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"k8s.io/apimachinery/pkg/labels"
+	corelisters "k8s.io/client-go/listers/core/v1"
 )
 
-// TelemetryStore maintains a background-updated cache of node metrics
-// to prevent synchronous network calls during scheduling.
+// MetricsSource fetches one node's measurements.
+type MetricsSource interface {
+	GetNodeMetrics(context.Context, string) (*NodeMetrics, error)
+}
+
+// TelemetryStore maintains a background-updated cache of node metrics.
 type TelemetryStore struct {
-	client     *TetragonClient
+	source     MetricsSource
+	nodes      corelisters.NodeLister
 	mu         sync.RWMutex
 	metrics    map[string]*NodeMetrics
 	stopped    chan struct{}
+	stopOnce   sync.Once
 	updateFreq time.Duration
 }
 
-// NewTelemetryStore creates and starts a background collector
-func NewTelemetryStore(client *TetragonClient, updateFreq time.Duration) *TelemetryStore {
+// NewTelemetryStore creates a store backed by the scheduler's node informer.
+func NewTelemetryStore(source MetricsSource, nodes corelisters.NodeLister, updateFreq time.Duration) *TelemetryStore {
 	if updateFreq <= 0 {
-		updateFreq = 1 * time.Second
+		updateFreq = time.Second
 	}
-	
-	s := &TelemetryStore{
-		client:     client,
+	return &TelemetryStore{
+		source:     source,
+		nodes:      nodes,
 		metrics:    make(map[string]*NodeMetrics),
 		stopped:    make(chan struct{}),
 		updateFreq: updateFreq,
 	}
-	
-	return s
 }
 
-// Start begins periodic background collection
-func (s *TelemetryStore) Start(ctx context.Context, nodeNames []string) {
+// Start begins node discovery and periodic collection.
+func (s *TelemetryStore) Start(ctx context.Context) {
 	go func() {
+		s.updateAll(ctx)
 		ticker := time.NewTicker(s.updateFreq)
 		defer ticker.Stop()
-		
 		for {
 			select {
 			case <-ctx.Done():
@@ -45,41 +52,62 @@ func (s *TelemetryStore) Start(ctx context.Context, nodeNames []string) {
 			case <-s.stopped:
 				return
 			case <-ticker.C:
-				s.updateAll(ctx, nodeNames)
+				s.updateAll(ctx)
 			}
 		}
 	}()
 }
 
-// updateAll fetches metrics for all nodes in parallel
-func (s *TelemetryStore) updateAll(ctx context.Context, nodeNames []string) {
+func (s *TelemetryStore) updateAll(ctx context.Context) {
+	if s.nodes == nil || s.source == nil {
+		return
+	}
+	nodes, err := s.nodes.List(labels.Everything())
+	if err != nil {
+		return
+	}
+
+	liveNodes := make(map[string]struct{}, len(nodes))
 	var wg sync.WaitGroup
-	for _, name := range nodeNames {
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		name := node.Name
+		liveNodes[name] = struct{}{}
 		wg.Add(1)
-		go func(node string) {
+		go func() {
 			defer wg.Done()
-			// Fast timeout for each node fetch
-			fetchCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			fetchCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 			defer cancel()
-			
-			if m, err := s.client.GetNodeMetrics(fetchCtx, node); err == nil {
-				s.mu.Lock()
-				s.metrics[node] = m
-				s.mu.Unlock()
+			metrics, fetchErr := s.source.GetNodeMetrics(fetchCtx, name)
+			if fetchErr != nil || metrics == nil {
+				return
 			}
-		}(name)
+			s.mu.Lock()
+			s.metrics[name] = metrics
+			s.mu.Unlock()
+		}()
 	}
 	wg.Wait()
+
+	s.mu.Lock()
+	for name := range s.metrics {
+		if _, ok := liveNodes[name]; !ok {
+			delete(s.metrics, name)
+		}
+	}
+	s.mu.Unlock()
 }
 
-// GetMetrics returns cached metrics for a node
+// GetMetrics returns the latest cached measurement for a node.
 func (s *TelemetryStore) GetMetrics(nodeName string) *NodeMetrics {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.metrics[nodeName]
 }
 
-// Stop stops the background collector
+// Stop stops background collection. It is safe to call more than once.
 func (s *TelemetryStore) Stop() {
-	close(s.stopped)
+	s.stopOnce.Do(func() { close(s.stopped) })
 }

@@ -17,10 +17,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .metrics_schema import (
-    NodeMetricsSnapshot,
+    CRITICALITY_LEVELS,
     FEATURE_DIM,
-    FEATURE_NAMES,
-    TETRAGON_METRICS_SCHEMA,
+    NodeMetricsSnapshot,
+    POD_FEATURE_NAMES,
+    WORKLOAD_TYPES,
 )
 
 
@@ -31,53 +32,42 @@ class PodContext:
     pod_namespace: str
     cpu_milli: int
     memory_bytes: int
+    priority: int = 0
     workload_type: str = "unknown"
-    criticality: str = "unknown"  # Phase 2: low, medium, high, unknown
+    criticality: str = "unknown"
     labels: dict[str, str] = None
     
-    # Feature names for dynamic dimension calculation
-    FEATURE_NAMES: list[str] = None  # Set after class definition
-    
-    # Workload type categories (order matters for one-hot encoding)
-    WORKLOAD_TYPES: list[str] = None  # Set after class definition
-    
-    # Criticality levels (Phase 2)
-    CRITICALITY_LEVELS: list[str] = None  # Set after class definition
+    FEATURE_NAMES: tuple[str, ...] = None
+    WORKLOAD_TYPES: tuple[str, ...] = None
+    CRITICALITY_LEVELS: tuple[str, ...] = None
     
     def __post_init__(self):
         if self.labels is None:
             self.labels = {}
     
     def to_feature_vector(self) -> list[float]:
-        """Convert pod requirements to normalized features."""
+        """Convert pod requirements according to the versioned feature contract."""
         from .config import NORMALIZATION
-        
-        # Normalize CPU
-        cpu_norm = min(1.0, self.cpu_milli / NORMALIZATION.MAX_CPU_MILLI)
-        
-        # Normalize memory
-        mem_norm = min(1.0, self.memory_bytes / NORMALIZATION.MAX_MEMORY_BYTES)
-        
-        # Workload type one-hot encoding
-        workload_onehot = [1.0 if self.workload_type == wt else 0.0 for wt in PodContext.WORKLOAD_TYPES]
-        
-        # Criticality one-hot encoding (Phase 2)
-        criticality_onehot = [1.0 if self.criticality == cl else 0.0 for cl in PodContext.CRITICALITY_LEVELS]
-        
-        return [cpu_norm, mem_norm] + workload_onehot + criticality_onehot
+
+        cpu_norm = max(0.0, min(1.0, self.cpu_milli / NORMALIZATION.MAX_CPU_MILLI))
+        memory_norm = max(0.0, min(1.0, self.memory_bytes / NORMALIZATION.MAX_MEMORY_BYTES))
+        priority_norm = (max(-1_000_000_000, min(1_000_000_000, self.priority)) + 1_000_000_000) / 2_000_000_000
+        workload_onehot = [
+            1.0 if self.workload_type == workload_type else 0.0
+            for workload_type in PodContext.WORKLOAD_TYPES
+        ]
+        criticality_onehot = [
+            1.0 if self.criticality == criticality else 0.0
+            for criticality in PodContext.CRITICALITY_LEVELS
+        ]
+        return [cpu_norm, memory_norm, priority_norm] + workload_onehot + criticality_onehot
 
 
-# Class-level constants (set after class definition to avoid dataclass issues)
-PodContext.WORKLOAD_TYPES = ["cpu-bound", "memory-bound", "io-bound", "balanced", "unknown"]
-PodContext.CRITICALITY_LEVELS = ["unknown", "low", "medium", "high"]  # Phase 2
-PodContext.FEATURE_NAMES = (
-    ["cpu_normalized", "memory_normalized"] 
-    + [f"workload_{wt}" for wt in PodContext.WORKLOAD_TYPES]
-    + [f"criticality_{cl}" for cl in PodContext.CRITICALITY_LEVELS]  # Phase 2
-)
-
-# Derived constant for use in model.py
-POD_CONTEXT_DIM = len(PodContext.FEATURE_NAMES)
+# Class-level constants share the versioned training/serving schema.
+PodContext.WORKLOAD_TYPES = WORKLOAD_TYPES
+PodContext.CRITICALITY_LEVELS = CRITICALITY_LEVELS
+PodContext.FEATURE_NAMES = POD_FEATURE_NAMES
+POD_CONTEXT_DIM = len(POD_FEATURE_NAMES)
 
 
 def encode_zone_diversity(zones: list[str], target_zone: str) -> float:
@@ -274,13 +264,21 @@ class ClusterTensorEncoder(nn.Module):
             for node in nodes_telemetry
         ]
         
+        criticality_names = ("unknown", "low", "medium", "high")
+        criticality = (
+            criticality_names[pod_requirements.criticality]
+            if 0 <= pod_requirements.criticality < len(criticality_names)
+            else "unknown"
+        )
         pod = PodContext(
             pod_name=pod_requirements.pod_name,
             pod_namespace=pod_requirements.pod_namespace,
             cpu_milli=pod_requirements.cpu_milli,
             memory_bytes=pod_requirements.memory_bytes,
+            priority=pod_requirements.priority,
             workload_type=pod_requirements.workload_type or "unknown",
-            labels=dict(pod_requirements.labels) if pod_requirements.labels else {},
+            criticality=criticality,
+            labels=dict(pod_requirements.labels),
         )
         
         return self.encode_node_snapshots(snapshots, pod, device)

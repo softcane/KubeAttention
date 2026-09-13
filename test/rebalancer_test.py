@@ -10,6 +10,7 @@ import torch
 from brain.rebalancer import Rebalancer
 from brain.metrics_schema import NodeMetricsSnapshot
 from brain.config import REBALANCER
+from brain.models.base import ScoringResult
 
 class TestRebalancer(unittest.IsolatedAsyncioTestCase):
     
@@ -35,7 +36,9 @@ class TestRebalancer(unittest.IsolatedAsyncioTestCase):
         mock_pod.metadata.annotations = {}
         mock_pod.spec.node_name = "node-bad"
         mock_pod.status.phase = "Running"
-        mock_pod.spec.containers = []
+        container = MagicMock()
+        container.resources.requests = {"cpu": "100m", "memory": "128Mi"}
+        mock_pod.spec.containers = [container]
         
         self.rebalancer.v1.list_pod_for_all_namespaces.return_value.items = [mock_pod]
         
@@ -46,10 +49,9 @@ class TestRebalancer(unittest.IsolatedAsyncioTestCase):
         self.telemetry_cache["node-good"] = snap_good
         
         # 3. Setup model return values
-        # score_batch returns list of results
-        self.model.score_batch.return_value = [
-            {"node_name": "node-bad", "score": 30, "confidence": 0.8, "reasoning": "High load"},
-            {"node_name": "node-good", "score": 80, "confidence": 0.9, "reasoning": "Low load"}
+        self.model.score_nodes.return_value = [
+            ScoringResult("node-bad", 30, "High load"),
+            ScoringResult("node-good", 80, "Low load"),
         ]
         
         # 4. Run rebalancer

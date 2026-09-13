@@ -1,269 +1,164 @@
 # KubeAttention
 
-**ML-Based Kubernetes Scheduling for Noisy Neighbor Avoidance**
+**Kubernetes scheduling with measured node pressure and validated ML scoring**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](https://go.dev)
-[![Python Version](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python)](https://python.org)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev)
+[![Python Version](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python)](https://python.org)
 
-KubeAttention is a residency-aware scheduler plugin that uses machine learning to detect and avoid noisy neighbor interference. By analyzing real-time eBPF telemetry (L3 cache misses, memory bandwidth, disk I/O wait), it places latency-sensitive workloads on nodes where they are least likely to suffer from resource contention.
+KubeAttention is an out-of-tree Kubernetes scheduler. It scores all feasible nodes in one Brain RPC, fails safely when telemetry or inference is unavailable, and records measured scheduling outcomes for later training.
 
----
-
-## The Problem
-
-Standard Kubernetes schedulers are blind to micro-architectural contention. They only see CPU and memory allocations. When a latency-critical pod is placed on a node with a hidden noisy neighbor (a cache-thrashing or memory-bandwidth-heavy workload):
-
-- P99 latency spikes by up to 65%
-- Tail latency becomes unpredictable
-- Hardware resources (L3 cache, memory bandwidth) saturate despite low CPU utilization
-
-## The Solution
-
-KubeAttention adds a machine learning "Brain" to the Kubernetes Scheduling Framework:
-
-1. **eBPF Telemetry**: Ingests 15 low-level metrics from Tetragon, including L3 cache miss rate, memory bandwidth, and disk I/O wait times.
-
-2. **Lightweight Scoring Models**: Uses MLP (neural network) or XGBoost (gradient boosted trees) for fast, context-aware node scoring:
-   - 26 input features (15 node metrics + 11 pod context)
-   - MLP: Sub-millisecond inference latency, 17KB model size
-   - XGBoost: Faster training, excellent for tabular telemetry data
-
-3. **High-Performance Architecture**:
-   - Background TelemetryStore: Polling happens out-of-band to ensure zero-latency scheduling
-   - Batch Inference: Amortizes gRPC overhead by scoring all candidate nodes in a single call
-   - Circuit Breaker: Falls back to default scheduling if inference exceeds 45ms
+The supported runtime telemetry source is Kubernetes Metrics Server. CPU and memory utilization participate in active scoring. Hardware-counter fields remain in the versioned feature schema, but the scheduler marks them unavailable unless a supported source supplies them. Missing values never masquerade as idle nodes.
 
 ---
 
-## Architecture
+## How it works
 
-```
-                           KubeAttention
-+----------------------------------------------------------------+
-|                                                                 |
-|  +-------------+         gRPC/UDS          +------------------+ |
-|  |   Gopher    |<------------------------->|      Brain       | |
-|  | (Go Plugin) |       (BatchScore)        | (MLP / XGBoost)  | |
-|  +------+------+                           +--------+---------+ |
-|         |                                           |           |
-|  +------v------+                                    |           |
-|  | Telemetry   |                                    v           |
-|  |   Store     |                           +------------------+ |
-|  +------+------+                           |    Tetragon      | |
-|         |                                  | (eBPF Observer)  | |
-|         +--------------------------------->+------------------+ |
-|                  eBPF / K8s Metrics                             |
-+----------------------------------------------------------------+
+1. The Go scheduler continuously caches node metrics.
+2. `PreScore` sends every feasible node and the complete pod context to the Python Brain.
+3. The Brain validates schema, timestamps, required measurements, and checkpoint compatibility before inference.
+4. Active mode contributes the returned scores to Kubernetes placement. Shadow mode returns neutral scores and writes the Brain recommendation to pod annotations after binding.
+5. The Collector persists candidate nodes, measured telemetry, the chosen node, and the observed pod outcome as JSONL.
+
+```text
+Kubernetes Metrics API
+          |
+          v
+  TelemetryStore -----> KubeAttention scheduler ----gRPC----> Brain
+                              |                                 |
+                              | Score / bind                    | validated checkpoint
+                              v                                 |
+                           Pod event ----------------------------+
+                              |
+                              v
+                      persistent Collector JSONL
 ```
 
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for details on the model architecture and eBPF feature set.
+The model input contract contains 15 node features and 11 pod features. Every checkpoint records the feature-schema version and input names. MLP and XGBoost return candidate-independent scores on the same absolute 0–100 scale.
+
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the feature and RPC contracts.
 
 ---
 
-## Benchmarks
+## Current validation
 
-### Model Comparison: MLP vs XGBoost
+The source and deployment repair was exercised on Kubernetes 1.35:
 
-KubeAttention supports two scoring models optimized for different trade-offs. Below are benchmark results from fresh tests run on January 14, 2026.
+- The scheduler executable started, acquired its leader lease, recovered from an initial Brain connection failure, and bound pods through the `kubeattention-scheduler` profile.
+- Shadow mode wrote a neutral recommendation annotation without changing placement. Active mode issued a successful Brain scoring RPC.
+- Metrics Server reported real node utilization. Controlled stress raised the designated worker to 47% CPU while the other workers remained at 0–1%.
+- The Collector wrote measured candidate-node records to its PVC and retained them across pod replacement.
+- Go tests, Python contract tests, image builds, and Helm lint passed.
 
-- **Live Validation**: E2E verification with Tetragon (eBPF) and metrics-server.
-- **Training data**: 1,000 synthetic scheduling events + live cluster fine-tuning.
-- Inference test: 10 candidate nodes, 100 iterations after warmup
-- Metrics: Average of 5 training runs
-- Hardware: Apple Silicon (M-series), Python 3.11
-
-**Inference Latency**
-
-MLP achieves 5x faster inference than XGBoost, making it the recommended choice for production environments where scheduling latency is critical.
-
-![Inference Latency Comparison](docs/assets/benchmark_latency.png)
-
-**Training Time**
-
-XGBoost trains 5x faster than MLP due to its optimized tree-building algorithms. This makes XGBoost ideal for rapid prototyping and frequent retraining.
-
-![Training Time Comparison](docs/assets/benchmark_training.png)
-
-**Model Size**
-
-MLP produces significantly smaller model files (29x smaller), reducing container image size and cold-start times.
-
-![Model Size Comparison](docs/assets/benchmark_size.png)
-
-### Summary Table
-
-| Metric | MLP | XGBoost | Winner |
-|--------|-----|---------|--------|
-| Inference Latency (avg) | 0.064ms | 0.342ms | MLP |
-| Inference Latency (p99) | 0.153ms | 0.577ms | MLP |
-| Training Time (50 epochs) | 0.997s | 0.216s | XGBoost |
-| Model Size | 17.3KB | 494KB | MLP |
-| Parameters | 3,490 | ~6,400 trees | - |
-
-**Recommendation**: Use MLP for production (5x lower latency, 29x smaller model). Use XGBoost for experimentation (5x faster training).
-
-### Latest End-to-End Validation (January 16, 2026)
-
-The KubeAttention stack was validated in a full E2E cycle on a Kind cluster with Tetragon and stress workloads.
-
-#### Training & Validation Results
-
-**1. Synthetic Pre-training**
-To bootstrap the model before deployment, we performed an initial training run on 100,000 synthetic events.
-- **Final Loss**: 0.0237 (Excellent convergence)
-- **Training Time**: 43.6s
-
-![Latest Training Curve](docs/assets/latest_training_curve.png)
-
-**2. Real Data Reinforcement (Primary Validation)**
-The core validation step involved fine-tuning the model on **real scheduling events** captured directly from the running Kind cluster.
-
-```bash
-# Actual command run during validation
-PYTHONPATH=. ./.venv/bin/python3 brain/training/train.py --train-data real_events.jsonl --model mlp
-```
-
-- **Source**: Live cluster telemetry from Collector pod
-- **Events**: 20 real-world scheduling decisions
-- **Training Time**: 1.8s
-- **Outcome**: Confirmed closed-loop learning from actual cluster behavior.
-
-#### Prediction and Rebalancing Performance
-In real cluster conditions with noisy neighbor workloads (HTTP echo, Redis latency, memory stress), KubeAttention correctly identifies sub-optimal node placements.
-
-![Latest Prediction Accuracy](docs/assets/latest_prediction_accuracy.png)
-
-| Scenario | Predicted Score | Result |
-|----------|-----------------|--------|
-| Clean Worker | 95/100 | Optimal Placement |
-| Noisy Neighbor (Worker 3) | 16/100 | Correct Placement Avoidance |
-| Memory Stress (stressnd) | Correctly Scored | Recommended for Migration |
-
+The measured Redis comparison issued 40,000 requests per scheduler. Worst per-pod P99 was `0.087 ms` for both the default scheduler and KubeAttention: **0% measured improvement**. This is valid integration evidence, not evidence that the current smoke checkpoint avoids noisy neighbors. Do not claim a latency win until a promoted model beats the held-out non-ML baseline and a repeated A/B run confirms it.
 
 ---
 
-## Getting Started
-
+## Getting started
 
 ### Prerequisites
 
-- Kubernetes 1.29 or later
-- Python 3.11 or later (for the Brain server)
-- Tetragon installed in the cluster for eBPF metrics
+- Kubernetes 1.35
+- Go 1.25
+- Python 3.12 or Docker
+- Helm 3
+- Kubernetes Metrics Server
 
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/softcane/KubeAttention.git
-cd KubeAttention
-
-# Install Python dependencies
-python -m venv .venv
-source .venv/bin/activate
-pip install -r brain/requirements.txt
-```
-
-### Model Selection
-
-KubeAttention supports two scoring models. Set the model type in `brain/config.py`:
-
-```python
-MODEL_TYPE = "mlp"     # Default: Fast inference (0.05ms), ~3,500 parameters
-MODEL_TYPE = "xgboost" # Alternative: Faster training, gradient boosted trees
-```
-
-### Training
-
-KubeAttention emphasizes real-world data captured from your production environment.
-
-**Production: Real Data Collection (Recommended)**
-
-1. Enable Shadow Mode: Set `shadowMode: true` in the scheduler arguments. KubeAttention will generate recommendations and log them to annotations without binding pods.
-
-2. Run the Collector: The collector watches for these decisions and records the outcome (evicted, OOM-killed, or successful).
-
-3. Train on Real Data:
-   ```bash
-   PYTHONPATH=. python brain/training/train.py --train-data /path/to/events.jsonl --model mlp
-   ```
-
-**Cost Function**
-
-The model is trained with weighted MSE loss:
-- **Node Label**: `0.4 × (1 - cpu) + 0.4 × (1 - mem) + 0.2 × (1 - l3_miss)`
-- **Outcome Weighting**: OOM/eviction failures are penalized 3× more than successful placements
-
-| Outcome | Score | Weight |
-|---------|-------|--------|
-| running | 1.0 | 1.0× |
-| oom_killed | 0.0 | 3.0× |
-| evicted | 0.0 | 3.0× |
-
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md#cost-function) for the complete formula.
-
-**Bootstrapping: Synthetic Data (Development Only)**
-
-For quick verification or CI pipelines:
+### Build
 
 ```bash
-# Generate synthetic data and train
-PYTHONPATH=. python brain/training/dataset.py
-PYTHONPATH=. python brain/training/train.py --train-data synthetic_data.jsonl --epochs 50
-```
-
-### Running the Brain
-
-The Brain runs as a gRPC server communicating over a Unix Domain Socket:
-
-```bash
-PYTHONPATH=. python -m brain.server --socket /tmp/brain.sock
-```
-
-### Building the Scheduler
-
-```bash
-cd pkg/scheduler
-go build -o kube-attention-scheduler
-```
-
-### Model Loading
-
-The Brain server loads a pre-trained model from `/app/brain/models/trained_model.pt`. To bake a model into the Docker image:
-
-```bash
-# Train the model
-PYTHONPATH=. python brain/training/train.py --train-data events.jsonl --model mlp
-
-# Copy to brain/models for Docker build
-cp checkpoints/best_model.pt brain/models/trained_model.pt
-
-# Build the image
+docker build -t kubeattention/scheduler:latest -f deploy/scheduler.Dockerfile .
 docker build -t kubeattention/brain:latest -f deploy/brain.Dockerfile .
+docker build -t kubeattention/collector:latest -f deploy/collector.Dockerfile .
 ```
+
+The Brain image installs the CPU-only PyTorch wheel. Its compressed image is about 652 MB on arm64 instead of 3.46 GB with the CUDA dependency set.
+
+### Run the Kind acceptance path
+
+```bash
+bash scripts/e2e-kind-full.sh
+```
+
+The script creates a disposable Kind cluster, builds all three images, installs Metrics Server, loads a schema-compatible smoke checkpoint, deploys the chart, checks scheduler and Collector behavior, and runs the measured Redis comparison. The smoke checkpoint validates integration; it is not a production model and the script does not claim a latency improvement.
+
+Set `KEEP_CLUSTER=1` to retain the cluster for inspection.
+
+### Deploy the Helm chart
+
+The Brain deliberately stays unready without a compatible checkpoint at `/models/best_model.pt`. Put a promoted MLP checkpoint in the `kubeattention-models` PVC before enabling the Brain and scheduler. Then install in shadow mode:
+
+```bash
+helm upgrade --install kubeattention helm/kubeattention \
+  --set scheduler.mode=shadow \
+  --set training.enabled=false
+```
+
+Pods opt in with:
+
+```yaml
+spec:
+  schedulerName: kubeattention-scheduler
+```
+
+After validating shadow annotations and the measured comparison, switch to active scoring:
+
+```bash
+helm upgrade kubeattention helm/kubeattention \
+  --reuse-values \
+  --set scheduler.mode=active
+```
+
+The scheduler deployment checksum restarts the process when its profile changes.
+
+### Train and promote a model
+
+Use Collector JSONL from a persistent volume. Training rejects synthetic, incomplete, or unmeasured records when the measured-data gate is enabled.
+
+```bash
+PYTHONPATH=. python brain/training/train.py \
+  --train-data /path/to/train-events.jsonl \
+  --val-data /path/to/held-out-events.jsonl \
+  --model mlp
+```
+
+Promotion requires the candidate to improve held-out mean squared error over the non-ML CPU/memory/cache-pressure baseline. Copy only a promoted, schema-compatible artifact to `/models/best_model.pt`, then restart the Brain deployment so it loads that artifact.
+
+### Run a measured comparison
+
+With the stack running in active mode:
+
+```bash
+python benchmark/runner.py \
+  --requests-per-pod 10000 \
+  --warmup-seconds 30 \
+  --output benchmark-results.json
+```
+
+The runner deploys the same Redis workload under controlled pressure with `default-scheduler` and `kubeattention-scheduler`. It records every pod's node, profile, request count, and Redis P50/P95/P99/maximum latency. Add `--require-improvement` when a non-positive worst-pod P99 result must fail CI.
 
 ---
 
-## Reliability and Safety
+## Reliability and safety
 
-- **Shadow Mode**: Run KubeAttention in parallel with the default scheduler to gather metrics without affecting placement.
-- **Fail-Safe Operations**: If the Brain is unreachable or slow (over 45ms), KubeAttention falls back to a neutral score of 50/100.
-- **Staleness Guard**: Telemetry older than 10 seconds is rejected to prevent stale data from influencing decisions.
-- **Explainable Decisions**: Every score includes a reasoning string explaining why the node received that score.
+- **Shadow by default:** recommendations are annotations; returned scheduler scores remain neutral.
+- **Bounded fallback:** unavailable Brain RPCs and incomplete telemetry return a score of 50 without panicking.
+- **Freshness guard:** node samples older than 30 seconds cannot drive active scoring.
+- **Strict readiness:** Brain health is false until a compatible checkpoint loads.
+- **Measured metrics:** the Prometheus endpoint reports observed request count, latency, readiness, and returned node scores.
+- **No automatic migration:** the rebalancer is disabled by default and only writes recommendations when explicitly enabled.
 
 ---
 
 ## Configuration
 
-All configurable parameters are centralized in `brain/config.py`:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| MAX_LATENCY_MS | 45 | Hard timeout for inference |
-| FALLBACK_SCORE | 50 | Score used when Brain is unavailable |
-| MAX_STALENESS_MS | 10000 | Maximum age of telemetry data |
-| MODEL_TYPE | mlp | Scoring model (mlp or xgboost) |
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `scheduler.mode` | `shadow` | Neutral annotation mode or active scoring |
+| `scheduler.timeoutMs` | `50` | Scheduler-to-Brain RPC deadline |
+| `brain.modelType` | `mlp` | MLP or XGBoost checkpoint format |
+| `MAX_STALENESS_MS` | `30000` | Maximum Brain telemetry age |
+| `rebalancer.enabled` | `false` | Enables annotation-only recommendations |
 
 ---
 

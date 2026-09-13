@@ -50,11 +50,15 @@ pip install -r brain/requirements.txt
 # Generate protobuf stubs
 buf generate
 
-# Build Go components
-cd pkg/scheduler && go build ./...
+# Build and test Go components
+go build ./cmd/scheduler ./cmd/collector
+go test ./...
 
-# Run tests
-./test/run_test_suite.sh
+# Run Python contract tests
+python -m unittest discover -s test -p "*_test.py" -v
+
+# Run the disposable Kind acceptance path
+bash scripts/e2e-kind-full.sh
 ```
 
 ## Making Changes

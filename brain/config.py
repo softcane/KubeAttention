@@ -6,6 +6,14 @@ This prevents magic numbers from being scattered throughout the codebase.
 """
 
 from dataclasses import dataclass, field
+import os
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -13,13 +21,12 @@ class InferenceConfig:
     """Inference latency and safety constraints."""
     MAX_LATENCY_MS: int = 500  # Increased for local Kind cluster testing
     FALLBACK_SCORE: int = 50
-    FALLBACK_CONFIDENCE: float = 0.1
 
 
 @dataclass(frozen=True)
 class TelemetryConfig:
     """Telemetry staleness and data quality thresholds."""
-    MAX_STALENESS_MS: int = 10_000  # 10 seconds
+    MAX_STALENESS_MS: int = 30_000  # Metrics Server updates every 15 seconds by default.
 
 
 @dataclass(frozen=True)
@@ -27,8 +34,6 @@ class ScoreConfig:
     """Scoring output constraints."""
     MIN_SCORE: int = 0
     MAX_SCORE: int = 100
-    MIN_CONFIDENCE: float = 0.0
-    MAX_CONFIDENCE: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -96,7 +101,9 @@ class ResilienceConfig:
 @dataclass(frozen=True)
 class RebalancerConfig:
     """Proactive rebalancing parameters (Phase 4)."""
-    ENABLED: bool = True
+    ENABLED: bool = field(
+        default_factory=lambda: _env_bool("REBALANCER_ENABLED", False)
+    )
     INTERVAL_SECONDS: int = 60  # Scan the cluster every minute
     SCORE_DELTA_THRESHOLD: int = 20  # Rebalance if target node is 20 points better
     MIN_SOURCE_SCORE: int = 40  # Only rebalance if source node is performing poorly
@@ -191,7 +198,9 @@ class ModelSelectionConfig:
     # Model type: "mlp" or "xgboost"
     # MLP: Lower latency (0.05ms), smaller size (16KB)
     # XGBoost: Faster training (0.1s), same accuracy
-    MODEL_TYPE: str = "mlp"  # Default to MLP for lowest latency
+    MODEL_TYPE: str = field(
+        default_factory=lambda: os.environ.get("MODEL_TYPE", "mlp")
+    )
 
 
 # Singleton instances for easy access

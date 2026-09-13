@@ -2,32 +2,30 @@
 
 ## Overview
 
-KubeAttention uses lightweight machine learning models (MLP or XGBoost) to score Kubernetes nodes based on real-time eBPF telemetry. The system detects noisy neighbor patterns that traditional schedulers miss, combined with a high-performance Go middleware that ensures minimal impact on scheduling throughput.
+KubeAttention runs as an out-of-tree Kubernetes scheduler. The Go plugin obtains node utilization from Metrics Server, sends all feasible nodes to the Python Brain in one protobuf request, and contributes the validated model scores to placement. Shadow mode records recommendations without changing scores.
 
-The previous Transformer-based architecture has been replaced with simpler, faster models that achieve the same accuracy with sub-millisecond inference latency.
+```text
+Metrics Server -> TelemetryStore -> Scheduler plugin -> Brain
+                                      |                 |
+                                      |                 +-> compatible MLP/XGBoost checkpoint
+                                      v
+                                Kubernetes binding
+                                      |
+                                      v
+                              persistent Collector JSONL
+```
+
+CPU and memory utilization are the current active-scoring measurements. The schema also reserves hardware contention fields. They remain explicitly unavailable until a supported per-node source populates them.
 
 ---
 
-## System Components
+## System components
 
-```
-                           KubeAttention
-+----------------------------------------------------------------+
-|                                                                 |
-|  +-------------+         gRPC/UDS          +------------------+ |
-|  |   Gopher    |<------------------------->|      Brain       | |
-|  | Score Plugin|       (BatchScore)        | (MLP / XGBoost)  | |
-|  +------+------+                           +--------+---------+ |
-|         |                                           |           |
-|  +------v------+                                    | PyTorch / |
-|  | Telemetry   |                                    | XGBoost   |
-|  |   Store     |                                    v           |
-|  +------+------+                           +------------------+ |
-|         |                                  |    Tetragon      | |
-|         +--------------------------------->| (eBPF Metrics)   | |
-|                                            +------------------+ |
-+----------------------------------------------------------------+
-```
+- **Scheduler:** Kubernetes 1.35 Scheduling Framework executable with `PreEnqueue`, `PreScore`, `Score`, normalization, and `PostBind`.
+- **TelemetryStore:** continuously discovers nodes and caches timestamped Metrics API samples.
+- **Brain:** validates request shape, feature-schema version, freshness, required measurements, and checkpoint compatibility before inference.
+- **Collector:** records measured candidate telemetry, placement, and delayed outcomes to a persistent JSONL file.
+- **Trainer:** fits MLP or XGBoost models and promotes a candidate only when measured held-out error beats the resource-pressure baseline.
 
 ---
 
@@ -35,14 +33,9 @@ The previous Transformer-based architecture has been replaced with simpler, fast
 
 ### Model Options
 
-KubeAttention supports two scoring models, selectable via `brain/config.py`:
+KubeAttention supports MLP and XGBoost scorers. `brain.modelType` selects the checkpoint format. Both backends emit candidate-independent quality values in `[0, 1]`, which the serving boundary converts to absolute integer scores in `[0, 100]`.
 
-| Model | Parameters | Inference | Training | Model Size |
-|-------|------------|-----------|----------|------------|
-| MLP (2-layer) | ~3,500 | 0.05ms | 2.5s | 16KB |
-| XGBoost | ~6,400 trees | 0.34ms | 0.1s | 100KB |
-
-**Default**: MLP is recommended for production due to lower inference latency.
+MLP is the default. Model promotion, rather than a hard-coded backend recommendation, decides whether a trained artifact is eligible for deployment.
 
 ### MLP Architecture
 
@@ -62,24 +55,24 @@ Input (26 features: 15 node + 11 pod)
 +-------------------+
     |
     v
-+-------------------+     +-------------------+
-| Score Head        |     | Confidence Head   |
-| Linear(32 -> 1)   |     | Linear(32 -> 1)   |
-| Sigmoid * 100     |     | Sigmoid           |
-+-------------------+     +-------------------+
-    |                         |
-    v                         v
- Score [0-100]          Confidence [0-1]
++-------------------+
+| Score Head        |
+| Linear(32 -> 1)   |
+| Sigmoid           |
++-------------------+
+          |
+          v
+   Quality [0-1]
 ```
 
 **Code**: `brain/models/mlp_scorer.py`
 
 ### XGBoost Architecture
 
-- Gradient boosted decision trees (100 estimators)
-- Max depth of 6 per tree
-- Trained with squared error objective
-- Min-max score normalization at inference
+- Gradient boosted decision trees
+- Squared-error training objective
+- Sigmoid conversion of each raw prediction to an absolute quality value
+- No candidate-relative min/max normalization
 
 **Code**: `brain/models/xgboost_scorer.py`
 
@@ -87,27 +80,27 @@ Input (26 features: 15 node + 11 pod)
 
 ## Feature Set
 
-The Brain receives 15 eBPF-derived node features plus 11 pod context features:
+The Brain receives 15 node features plus 11 pod-context features. Every `NodeTelemetry` message carries an availability mask and a schema version, so zero and missing have different meanings.
 
-### Node Features (15)
+### Node features (15)
 
-| Feature | Source | Purpose |
-|---------|--------|---------|
-| cpu_utilization | sched:sched_stat_runtime | Basic CPU load |
-| cpu_throttle_rate | cgroup:cgroup_throttle | CPU contention indicator |
-| memory_utilization | kprobe:__alloc_pages | Memory pressure |
-| memory_bandwidth_gbps | perf:mem_load_retired | Noisy neighbor signal |
-| l3_cache_miss_rate | perf:cache_misses | Critical: LLC contention |
-| l3_cache_occupancy_mb | perf:llc_occupancy | Cache pressure |
-| disk_io_wait_ms | block:block_rq_complete | I/O bottleneck |
-| disk_iops | block:block_rq_issue | I/O load |
-| network_rx_packets_sec | net:netif_receive_skb | Network load |
-| network_tx_packets_sec | net:net_dev_xmit | Network load |
-| network_drop_rate | skb:kfree_skb | Network saturation |
-| node_cost_index | metadata | Cost optimization |
-| is_spot_instance | metadata | Resilience scoring |
-| spot_interruption_risk | metadata | Risk assessment |
-| zone_diversity_score | computed | Zone spread incentive |
+| Feature | Current runtime source |
+|---------|------------------------|
+| `cpu_utilization` | Metrics Server usage / allocatable CPU |
+| `memory_utilization` | Metrics Server working set / allocatable memory |
+| `cpu_throttle_rate` | unavailable |
+| `memory_bandwidth_gbps` | unavailable |
+| `l3_cache_miss_rate` | unavailable |
+| `l3_cache_occupancy_mb` | unavailable |
+| `disk_io_wait_ms` | unavailable |
+| `disk_iops` | unavailable |
+| `network_rx_packets_sec` | unavailable |
+| `network_tx_packets_sec` | unavailable |
+| `network_drop_rate` | unavailable |
+| `node_cost_index` | node-label/default metadata |
+| `is_spot_instance` | node-label metadata |
+| `spot_interruption_risk` | node-label/default metadata |
+| `zone_diversity_score` | node topology metadata |
 
 ### Pod Context Features (11)
 
@@ -145,58 +138,46 @@ X = concatenate(node_features, broadcast(pod_features, N))
 ### Forward Pass
 
 ```python
-# MLP inference
-scores, confidences = model(X)  # Returns (N,) scores in [0, 100]
+qualities = model.predict_quality(X)  # Candidate-independent values in [0, 1]
+scores = clip(qualities * 100, 0, 100)
 
-# Generate reasoning for each node
 for i, node in enumerate(nodes):
     reasoning = generate_reasoning(node.name, scores[i], node_features[i])
 ```
 
 ### Output
 
-```
-ScoringResult {
-    node_name: str       # "node-1"
-    score: int           # 0-100 (higher is better)
-    confidence: float    # 0-1 (model's confidence)
-    reasoning: str       # "Node node-1: low CPU load, ample memory (CPU=30%, Mem=40%)"
+```text
+NodeScore {
+    node_name: string
+    score: int64
+    reasoning: string
 }
 ```
 
----
-
-## High-Performance Gopher Plugin
-
-To meet the strict latency requirements of the Kubernetes scheduler, the Go plugin implements several critical optimizations:
-
-### TelemetryStore (Background Polling)
-
-The TelemetryStore runs as a singleton background process. It periodically fetches metrics from Tetragon and caches node states. This ensures that the Score function never makes a synchronous network call to fetch metrics.
-
-### PreScore Batching
-
-Instead of calling the Brain gRPC endpoint for every node sequentially (which would scale O(N) where N is the number of nodes), KubeAttention uses the PreScore phase to send one batch request for all candidate nodes. This reduces the total scheduling overhead to O(1) gRPC roundtrips.
-
-### Circuit Breaker and Safety
-
-The BrainClient monitors latency and error rates. If the Brain takes over 45ms or returns errors, the plugin automatically trips the circuit breaker and falls back to neutral scores (50/100), ensuring cluster stability even if the ML components fail.
+The API does not expose a confidence value. Neither backend trains or calibrates one.
 
 ---
 
-## Why Lightweight Models?
+## Go scheduler plugin
 
-The original Transformer architecture was replaced for several reasons:
+### TelemetryStore
 
-| Concern | Transformer | MLP/XGBoost |
-|---------|-------------|-------------|
-| Inference latency | 5-10ms | 0.05-0.34ms |
-| Model complexity | ~500K params | ~3.5K params |
-| Memory footprint | 2GB+ | 16-100KB |
-| Training time | Hours | Seconds |
-| Cold start | Slow | Instant |
+One background store follows the shared node informer and refreshes Metrics Server samples once per second. `PreScore` reads only the cache; it does not perform one telemetry request per candidate.
 
-The key insight is that node scoring is primarily a tabular regression problem. The input features are well-structured eBPF metrics, not sequences or images. Simple models perform equally well with dramatically better latency.
+### PreScore batching
+
+`PreScore` sends one `BatchScore` RPC containing all feasible nodes. `Score` reads the corresponding result from typed cycle state. This keeps network round trips constant while local encoding and model work still scale with the number of candidates.
+
+### Connection and failure safety
+
+The Brain client uses generated protobuf stubs, reconnects after startup or service loss, enforces the scheduler's RPC deadline, and opens one circuit breaker after repeated failures. Disconnection, timeout, malformed response, stale data, or missing measurements produce bounded neutral scores.
+
+---
+
+## Why lightweight models?
+
+The feature tensor is small tabular data rather than a sequence. MLP and gradient-boosted trees fit this contract without a transformer. A candidate still must beat the held-out non-ML baseline before promotion; model type alone is not evidence of accuracy or latency protection.
 
 ---
 
@@ -213,7 +194,7 @@ Training data is collected via the Collector component watching scheduling event
         "node-1": {
             "cpu_utilization": 0.092,    # From metrics-server
             "memory_utilization": 0.111, # From metrics-server
-            "l3_cache_miss_rate": 0.0,   # From Tetragon (when available)
+            "l3_cache_miss_rate": 0.0,   # Unavailable in the current source
             ...
         }
     },
@@ -300,54 +281,39 @@ This weighting scheme ensures the model learns aggressively from failures (OOM, 
 
 ---
 
-## Performance Constraints
+## Runtime constraints
 
-| Constraint | Target | Implementation |
-|------------|--------|----------------|
-| Inference Latency | < 1ms | Lightweight MLP |
-| Fallback Behavior | 50/100 score | Circuit breaker |
-| Telemetry Staleness | < 10s | Staleness guard |
-| Memory Footprint | < 50MB | No GPU required |
-
----
-
-## Proactive Rebalancer (Phase 4)
-
-The Rebalancer runs as a background audit loop that identifies pods on sub-optimal nodes:
-
-1. Scans all running pods every 60 seconds
-2. Scores current node vs all alternatives
-3. If current node scores below 40 AND an alternative is 20+ points better:
-   - Annotates the pod with `kubeattention.io/rebalance-target`
-   - External controller can use this annotation to trigger eviction
-
-### Verified E2E Results
-
-In our Kind cluster testing (January 2026), the Rebalancer successfully identified 4 pods for migration with score deltas of 33-34 points:
-
-```
-benchmark/http-echo-bcvr4          -> worker (delta: 33)
-benchmark/redis-latency-test-cc58n -> worker (delta: 34)
-benchmark/stress-membw-v2q2p       -> worker (delta: 33)
-kubeattention/collector-xsgqm      -> worker (delta: 33)
-```
+| Constraint | Behavior |
+|------------|----------|
+| Scheduler RPC deadline | 50 ms by default |
+| Brain inference ceiling | bounded by both the caller deadline and Brain safety limit |
+| Fallback | neutral score `50` |
+| Telemetry staleness | samples older than 30 seconds are degraded |
+| Missing required metrics | neutral batch; no inferred zero load |
+| Missing/incompatible checkpoint | Brain readiness remains false |
 
 ---
 
-## Model Loading
+## Proactive rebalancer
 
-The Brain server loads a pre-trained model on startup from:
+The rebalancer is disabled by default. When explicitly enabled, it scans running pods and writes recommendation annotations only. It does not evict, migrate, or reschedule workloads. Operators must treat its annotations as advisory.
 
+---
+
+## Model loading
+
+The Brain reads `MODEL_PATH`, which the Helm chart sets to:
+
+```text
+/models/best_model.pt
 ```
-/app/brain/models/trained_model.pt
-```
 
-If no model is found, the server uses random initialization and logs a warning. To bake a model into the Docker image, place it in `brain/models/trained_model.pt` before building.
+Startup validates the checkpoint's input width, feature-schema version, and feature names. A missing or incompatible artifact keeps the Brain unready; the server never advertises a random model as healthy. A newly promoted artifact takes effect after the Brain pod restarts.
 
 ---
 
 ## Further Reading
 
 - [Kubernetes Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)
-- [Tetragon eBPF](https://tetragon.io/) - Runtime security observability
+- [Kubernetes Metrics Server](https://github.com/kubernetes-sigs/metrics-server)
 - [XGBoost Documentation](https://xgboost.readthedocs.io/)

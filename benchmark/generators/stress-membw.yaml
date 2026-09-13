@@ -38,10 +38,9 @@ spec:
               memory: "1Gi"
       affinity:
         nodeAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              preference:
-                matchExpressions:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
                   - key: kubeattention.io/profile
                     operator: In
-                    values: ["noisy-1", "noisy-2"]
+                    values: ["noisy-a"]

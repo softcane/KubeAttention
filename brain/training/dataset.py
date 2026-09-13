@@ -18,11 +18,10 @@ try:
 except ImportError:
     HAS_PARQUET = False
 
-# Import feature definitions from single source of truth
+# Import the versioned feature contract used by serving.
 import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from brain.metrics_schema import FEATURE_NAMES, TETRAGON_METRICS_SCHEMA
+from brain.metrics_schema import FEATURE_NAMES, normalize_node_record
 from brain.tensor_encoder import PodContext
 from brain.config import DATASET, CLUSTER, TRAINING
 
@@ -119,12 +118,8 @@ class SchedulingDataset(Dataset):
         node_features = np.zeros((self.max_nodes, self.temporal_window, len(FEATURE_NAMES)))
         
         for i, node_name in enumerate(node_names):
-            metrics = node_telemetry[node_name]
-            for j, feature_name in enumerate(FEATURE_NAMES):
-                value = metrics.get(feature_name, 0.0)
-                # Normalize to [0, 1] range
-                # Fill all temporal snapshots with current value for single-shot data
-                node_features[i, :, j] = self._normalize_feature(feature_name, value)
+            features = normalize_node_record(node_telemetry[node_name])
+            node_features[i, :, :] = features
         
         # Build pod context using the shared PodContext class (Issue 10 fix: unify encoding)
         pod = PodContext(
@@ -132,9 +127,10 @@ class SchedulingDataset(Dataset):
             pod_namespace=event.get("pod_namespace", ""),
             cpu_milli=event.get("cpu_request_milli", 0),
             memory_bytes=event.get("memory_request_bytes", 0),
+            priority=event.get("priority", 0),
             workload_type=event.get("workload_type", "unknown"),
             criticality=event.get("criticality", "unknown"),
-            labels=event.get("pod_labels", {})
+            labels=event.get("pod_labels", {}),
         )
         pod_context = np.array(pod.to_feature_vector(), dtype=np.float32)
         
@@ -195,15 +191,6 @@ class SchedulingDataset(Dataset):
             "num_nodes": torch.tensor(num_nodes, dtype=torch.long),
         }
     
-    def _normalize_feature(self, feature_name: str, value: float) -> float:
-        """Normalize a feature to [0, 1] range using TETRAGON_METRICS_SCHEMA."""
-        # Use single source of truth for normalization ranges
-        for spec in TETRAGON_METRICS_SCHEMA:
-            if spec.name == feature_name:
-                normalized = (value - spec.min_value) / (spec.max_value - spec.min_value + 1e-8)
-                return max(0.0, min(1.0, normalized))
-        # Fallback for unknown features
-        return max(0.0, min(1.0, value))
 
 
 def create_dataloader(
@@ -304,7 +291,7 @@ def generate_synthetic_data(output_path: str, num_samples: int = None):
                 "network_tx_packets_sec": random.uniform(0, 100000),
                 "network_drop_rate": random.uniform(0, 0.01),
                 "cpu_throttle_rate": random.uniform(0, 100),
-                "node_cost_index": cost_idx,
+                "cost_per_hour": cost_idx,
                 "is_spot_instance": is_spot,
                 "availability_zone": zone,
                 "spot_interruption_risk": spot_risk,

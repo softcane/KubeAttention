@@ -1,0 +1,109 @@
+{{- if .Values.scheduler.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kubeattention.fullname" . }}-scheduler-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "kubeattention.labels" . | nindent 4 }}
+data:
+  scheduler-config.yaml: |
+    apiVersion: kubescheduler.config.k8s.io/v1
+    kind: KubeSchedulerConfiguration
+    leaderElection:
+      leaderElect: true
+      resourceName: {{ include "kubeattention.fullname" . }}-scheduler
+      resourceNamespace: {{ .Values.namespace }}
+    profiles:
+      - schedulerName: {{ .Values.scheduler.name }}
+        plugins:
+          preEnqueue:
+            enabled:
+              - name: KubeAttention
+          preScore:
+            enabled:
+              - name: KubeAttention
+          score:
+            enabled:
+              - name: KubeAttention
+                weight: 1
+          postBind:
+            enabled:
+              - name: KubeAttention
+        pluginConfig:
+          - name: KubeAttention
+            args:
+              brainEndpoint: {{ include "kubeattention.fullname" . }}-brain:{{ .Values.brain.grpcPort }}
+              timeoutMs: {{ .Values.scheduler.timeoutMs }}
+              mode: {{ .Values.scheduler.mode }}
+              fallbackScore: 50
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubeattention.fullname" . }}-scheduler
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: scheduler
+    {{- include "kubeattention.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scheduler
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        checksum/scheduler-config: {{ printf "%s:%v:%s:%v" .Values.scheduler.name .Values.scheduler.timeoutMs .Values.scheduler.mode .Values.brain.grpcPort | sha256sum }}
+      labels:
+        app: scheduler
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "kubeattention.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: scheduler
+          image: "{{ .Values.scheduler.image.repository }}:{{ .Values.scheduler.image.tag }}"
+          imagePullPolicy: {{ .Values.scheduler.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          args:
+            - --config=/etc/kubeattention/scheduler-config.yaml
+          resources:
+            {{- toYaml .Values.scheduler.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kubeattention
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /livez
+              port: 10259
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /readyz
+              port: 10259
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /livez
+              port: 10259
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "kubeattention.fullname" . }}-scheduler-config
+        - name: tmp
+          emptyDir: {}
+{{- end }}

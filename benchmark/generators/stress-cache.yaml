@@ -36,13 +36,12 @@ spec:
             limits:
               cpu: "1000m"
               memory: "512Mi"
-      # Prefer noisy nodes (for controlled testing)
+      # Keep controlled pressure on the node labelled noisy by kind-config.yaml.
       affinity:
         nodeAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              preference:
-                matchExpressions:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
                   - key: kubeattention.io/profile
                     operator: In
-                    values: ["noisy-1", "noisy-2"]
+                    values: ["noisy-a"]

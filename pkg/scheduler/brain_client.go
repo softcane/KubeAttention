@@ -1,8 +1,5 @@
 /*
-Package scheduler implements the KubeAttention gRPC client for the Brain.
-
-This client communicates with the Python Brain server over Unix Domain Socket,
-implementing circuit breaker pattern with 50ms timeout fallback.
+Package scheduler implements the fail-safe gRPC client used by the scheduler.
 */
 package scheduler
 
@@ -10,319 +7,291 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
+	schedulerpb "github.com/softcane/KubeAttention/gen/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
-	// DefaultUDSPath is the production Unix socket path
-	DefaultUDSPath = "/var/run/kubeattention/brain.sock"
-	
-	// DevUDSPath is for local development/testing
-	DevUDSPath = "/tmp/kubeattention-brain.sock"
-	
-	// DefaultTimeout is the circuit breaker timeout (50ms as per PLAN.md)
-	DefaultTimeout = 50 * time.Millisecond
-	
-	// HealthCheckInterval for circuit breaker
-	HealthCheckInterval = 5 * time.Second
-	
-	// CircuitBreakerThreshold - failures before opening circuit
+	DefaultUDSPath          = "/var/run/kubeattention/brain.sock"
+	DevUDSPath              = "/tmp/kubeattention-brain.sock"
+	DefaultTimeout          = 50 * time.Millisecond
 	CircuitBreakerThreshold = 3
+	HealthCheckInterval     = 5 * time.Second
 )
 
-// CircuitState represents the state of the circuit breaker
+// CircuitState represents the state of the Brain circuit breaker.
 type CircuitState int
 
 const (
-	CircuitClosed CircuitState = iota // Normal operation
-	CircuitOpen                       // Failing, use fallback
-	CircuitHalfOpen                   // Testing if service recovered
+	CircuitClosed CircuitState = iota
+	CircuitOpen
+	CircuitHalfOpen
 )
 
-// BrainClient wraps the gRPC connection to the Brain with circuit breaker
+// BrainClient wraps the generated Brain client with bounded fallback and recovery.
 type BrainClient struct {
-	conn         *grpc.ClientConn
-	udsPath      string
-	timeout      time.Duration
-	
-	// Circuit breaker state
-	mu              sync.RWMutex
+	endpoint         string
+	timeout          time.Duration
+	recoveryInterval time.Duration
+
+	connectMu sync.Mutex
+	mu        sync.RWMutex
+	conn      *grpc.ClientConn
+	client    schedulerpb.BrainClient
+
 	circuitState    CircuitState
 	failureCount    int
 	lastFailureTime time.Time
 	lastLatencyMs   int64
 }
 
-// ScoreRequest mirrors the proto ScoreRequest
-type ScoreRequest struct {
-	PodName      string
-	PodNamespace string
-	NodeName     string
-	Telemetry    map[string]float64
-}
-
-// ScoreResponse mirrors the proto ScoreResponse
-type ScoreResponse struct {
-	Score      int64
-	Reasoning  string
-	Confidence float64
-}
-
-// NodeScore matches proto NodeScore
-type NodeScore struct {
-	NodeName   string
-	Score      int64
-	Reasoning  string
-	Confidence float64
-}
-
-// BatchScoreRequest matches proto BatchScoreRequest
-type BatchScoreRequest struct {
-	PodName      string
-	PodNamespace string
-	Nodes        []ScoreRequest // Contains per-node telemetry
-}
-
-// BatchScoreResponse matches proto BatchScoreResponse
-type BatchScoreResponse struct {
-	Scores []NodeScore
-}
-
-// NewBrainClient creates a new client with circuit breaker
-func NewBrainClient(udsPath string, timeout time.Duration) (*BrainClient, error) {
-	if udsPath == "" {
-		udsPath = DevUDSPath
+// NewBrainClient creates a Brain client. The endpoint may be a Unix socket path,
+// unix:///path, or a TCP gRPC target such as brain:50051.
+func NewBrainClient(endpoint string, timeout time.Duration) (*BrainClient, error) {
+	if endpoint == "" {
+		endpoint = DevUDSPath
 	}
-	if timeout == 0 {
+	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	
-	client := &BrainClient{
-		udsPath:      udsPath,
-		timeout:      timeout,
-		circuitState: CircuitClosed,
-	}
-	
-	return client, nil
+	return &BrainClient{endpoint: endpoint, timeout: timeout, recoveryInterval: HealthCheckInterval}, nil
 }
 
-// Connect establishes the gRPC connection
+// Connect establishes and verifies the gRPC connection.
 func (c *BrainClient) Connect(ctx context.Context) error {
-	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
-		return net.Dial("unix", c.udsPath)
-	}
-	
-	conn, err := grpc.DialContext(ctx,
-		c.udsPath,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(dialer),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to connect to Brain at %s: %w", c.udsPath, err)
-	}
-	
-	c.conn = conn
-	return nil
-}
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
 
-// Close closes the gRPC connection
-func (c *BrainClient) Close() error {
-	if c.conn != nil {
-		return c.conn.Close()
-	}
-	return nil
-}
-
-// Score sends a scoring request to the Brain with circuit breaker
-func (c *BrainClient) Score(ctx context.Context, req *ScoreRequest) (*ScoreResponse, error) {
-	// Check circuit breaker
-	c.mu.RLock()
-	state := c.circuitState
-	c.mu.RUnlock()
-	
-	if state == CircuitOpen {
-		// Check if we should try half-open
-		c.mu.Lock()
-		if time.Since(c.lastFailureTime) > HealthCheckInterval {
-			c.circuitState = CircuitHalfOpen
-			state = CircuitHalfOpen
-		}
-		c.mu.Unlock()
-		
-		if state == CircuitOpen {
-			return c.fallbackScore(req), nil
+	if client := c.snapshotClient(); client != nil {
+		if err := c.checkHealth(ctx, client); err == nil {
+			c.recordSuccess()
+			return nil
 		}
 	}
-	
-	// Create timeout context
-	timeoutCtx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	
-	start := time.Now()
-	
-	// Make the actual gRPC call
-	resp, err := c.doScore(timeoutCtx, req)
-	
-	elapsed := time.Since(start)
-	c.lastLatencyMs = elapsed.Milliseconds()
-	
+
+	target, dialOptions := c.dialConfig()
+	conn, err := grpc.DialContext(ctx, target, dialOptions...)
 	if err != nil {
 		c.recordFailure()
-		
-		// If circuit is half-open, revert to open
-		c.mu.Lock()
-		if c.circuitState == CircuitHalfOpen {
-			c.circuitState = CircuitOpen
-		}
-		c.mu.Unlock()
-		
-		// Return fallback
-		return c.fallbackScore(req), nil
+		return fmt.Errorf("connect to Brain at %s: %w", c.endpoint, err)
 	}
-	
-	// Success - reset circuit breaker
+	client := schedulerpb.NewBrainClient(conn)
+	if err := c.checkHealth(ctx, client); err != nil {
+		_ = conn.Close()
+		c.recordFailure()
+		return fmt.Errorf("verify Brain at %s: %w", c.endpoint, err)
+	}
+
 	c.mu.Lock()
+	oldConn := c.conn
+	c.conn = conn
+	c.client = client
 	c.failureCount = 0
 	c.circuitState = CircuitClosed
 	c.mu.Unlock()
-	
-	return resp, nil
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
+	return nil
 }
 
-// BatchScore sends a batch of nodes to the Brain for parallel scoring
-func (c *BrainClient) BatchScore(ctx context.Context, req *BatchScoreRequest) (*BatchScoreResponse, error) {
-	c.mu.RLock()
-	state := c.circuitState
-	c.mu.RUnlock()
+func (c *BrainClient) dialConfig() (string, []grpc.DialOption) {
+	options := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	}
+	if strings.HasPrefix(c.endpoint, "/") || strings.HasPrefix(c.endpoint, "unix://") {
+		path := strings.TrimPrefix(c.endpoint, "unix://")
+		dialer := &net.Dialer{}
+		options = append(options, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", path)
+		}))
+		return "passthrough:///kubeattention-brain", options
+	}
+	return c.endpoint, options
+}
 
-	if state == CircuitOpen {
-		return c.fallbackBatchScore(req), nil
+// Close closes the current gRPC connection.
+func (c *BrainClient) Close() error {
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.client = nil
+	c.mu.Unlock()
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
+}
+
+// Score sends a single-node request or returns a neutral fallback.
+func (c *BrainClient) Score(ctx context.Context, req *schedulerpb.ScoreRequest) (*schedulerpb.ScoreResponse, error) {
+	client, ok := c.availableClient(ctx)
+	if !ok {
+		return fallbackScore(req), nil
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	callCtx, cancel := c.callContext(ctx)
 	defer cancel()
-
 	start := time.Now()
-	resp := new(BatchScoreResponse)
-	err := c.conn.Invoke(timeoutCtx, "/scheduler.Brain/BatchScore", req, resp)
-	
-	c.lastLatencyMs = time.Since(start).Milliseconds()
-
+	resp, err := client.Score(callCtx, req)
+	c.setLatency(time.Since(start))
 	if err != nil {
 		c.recordFailure()
-		return c.fallbackBatchScore(req), nil
+		return fallbackScore(req), nil
 	}
-
+	c.recordSuccess()
 	return resp, nil
 }
 
-func (c *BrainClient) fallbackBatchScore(req *BatchScoreRequest) *BatchScoreResponse {
-	resp := &BatchScoreResponse{
-		Scores: make([]NodeScore, len(req.Nodes)),
+// BatchScore sends all candidates in one request or returns neutral scores.
+func (c *BrainClient) BatchScore(ctx context.Context, req *schedulerpb.BatchScoreRequest) (*schedulerpb.BatchScoreResponse, error) {
+	client, ok := c.availableClient(ctx)
+	if !ok {
+		return fallbackBatchScore(req), nil
 	}
-	for i, node := range req.Nodes {
-		fallback := c.fallbackScore(&node)
-		resp.Scores[i] = NodeScore{
-			NodeName:   node.NodeName,
-			Score:      fallback.Score,
-			Reasoning:  fallback.Reasoning,
-			Confidence: fallback.Confidence,
-		}
-	}
-	return resp
-}
 
-// doScore performs the actual gRPC call
-func (c *BrainClient) doScore(ctx context.Context, req *ScoreRequest) (*ScoreResponse, error) {
-	if c.conn == nil {
-		return nil, fmt.Errorf("not connected")
-	}
-	
-	// Use raw gRPC call (would use generated stubs after buf generate)
-	// For handshake test, we send a minimal request
-	
-	out := new(ScoreResponse)
-	err := c.conn.Invoke(ctx, "/scheduler.Brain/Score", req, out)
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	start := time.Now()
+	resp, err := client.BatchScore(callCtx, req)
+	c.setLatency(time.Since(start))
 	if err != nil {
-		return nil, err
+		c.recordFailure()
+		return fallbackBatchScore(req), nil
 	}
-	
-	return out, nil
+	c.recordSuccess()
+	return resp, nil
 }
 
-// recordFailure updates circuit breaker state
+func (c *BrainClient) availableClient(ctx context.Context) (schedulerpb.BrainClient, bool) {
+	c.mu.RLock()
+	client := c.client
+	state := c.circuitState
+	lastFailure := c.lastFailureTime
+	c.mu.RUnlock()
+
+	if client != nil && state != CircuitOpen {
+		return client, true
+	}
+	if state == CircuitOpen && time.Since(lastFailure) < c.recoveryInterval {
+		return nil, false
+	}
+
+	connectCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	if err := c.Connect(connectCtx); err != nil {
+		return nil, false
+	}
+	return c.snapshotClient(), true
+}
+
+func (c *BrainClient) snapshotClient() schedulerpb.BrainClient {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.client
+}
+
+func (c *BrainClient) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, c.timeout)
+}
+
+func (c *BrainClient) checkHealth(ctx context.Context, client schedulerpb.BrainClient) error {
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	resp, err := client.HealthCheck(callCtx, &schedulerpb.HealthCheckRequest{})
+	if err != nil {
+		return err
+	}
+	if !resp.GetHealthy() {
+		return fmt.Errorf("Brain reports unhealthy")
+	}
+	return nil
+}
+
 func (c *BrainClient) recordFailure() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
 	c.failureCount++
 	c.lastFailureTime = time.Now()
-	
 	if c.failureCount >= CircuitBreakerThreshold {
 		c.circuitState = CircuitOpen
 	}
 }
 
-// fallbackScore returns LeastAllocated-style score as fallback
-func (c *BrainClient) fallbackScore(req *ScoreRequest) *ScoreResponse {
-	// Simple fallback: use CPU utilization if available
-	score := int64(50) // Default middle score
-	
-	if cpuUtil, ok := req.Telemetry["cpu_utilization"]; ok {
-		// Invert utilization: lower usage = higher score
-		score = int64((1.0 - cpuUtil) * 100)
-	}
-	
-	return &ScoreResponse{
-		Score:      score,
-		Reasoning:  "Fallback: Brain unavailable, using LeastAllocated strategy",
-		Confidence: 0.5, // Lower confidence for fallback
+func (c *BrainClient) recordSuccess() {
+	c.mu.Lock()
+	c.failureCount = 0
+	c.circuitState = CircuitClosed
+	c.mu.Unlock()
+}
+
+func (c *BrainClient) setLatency(elapsed time.Duration) {
+	c.mu.Lock()
+	c.lastLatencyMs = elapsed.Milliseconds()
+	c.mu.Unlock()
+}
+
+func fallbackScore(req *schedulerpb.ScoreRequest) *schedulerpb.ScoreResponse {
+	return &schedulerpb.ScoreResponse{
+		Score:     50,
+		Reasoning: "Brain unavailable or unhealthy; neutral score",
 	}
 }
 
-// GetCircuitState returns current circuit breaker state
+func fallbackBatchScore(req *schedulerpb.BatchScoreRequest) *schedulerpb.BatchScoreResponse {
+	if req == nil {
+		return &schedulerpb.BatchScoreResponse{}
+	}
+	scores := make([]*schedulerpb.NodeScore, 0, len(req.GetNodes()))
+	for _, node := range req.GetNodes() {
+		scores = append(scores, &schedulerpb.NodeScore{
+			NodeName:  node.GetNodeName(),
+			Score:     50,
+			Reasoning: "Brain unavailable or unhealthy; neutral score",
+		})
+	}
+	return &schedulerpb.BatchScoreResponse{Scores: scores}
+}
+
+// GetCircuitState returns the current circuit state.
 func (c *BrainClient) GetCircuitState() CircuitState {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.circuitState
 }
 
-// GetLastLatency returns the last measured latency in milliseconds
+// GetLastLatency returns the last measured RPC latency in milliseconds.
 func (c *BrainClient) GetLastLatency() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.lastLatencyMs
 }
 
-// HealthCheck performs a lightweight health check on the Brain
+// HealthCheck verifies that Brain is reachable and has a usable model.
 func (c *BrainClient) HealthCheck(ctx context.Context) (bool, int64, error) {
-	if c.conn == nil {
-		return false, 0, fmt.Errorf("not connected")
+	client, ok := c.availableClient(ctx)
+	if !ok {
+		return false, c.GetLastLatency(), fmt.Errorf("Brain unavailable")
 	}
-	
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	callCtx, cancel := c.callContext(ctx)
 	defer cancel()
-	
 	start := time.Now()
-	
-	// Invoke health check RPC
-	type healthResp struct {
-		Healthy      bool
-		LatencyMs    int64
-		ModelVersion string
-	}
-	
-	resp := new(healthResp)
-	err := c.conn.Invoke(timeoutCtx, "/scheduler.Brain/HealthCheck", struct{}{}, resp)
-	
-	elapsed := time.Since(start)
-	
+	resp, err := client.HealthCheck(callCtx, &schedulerpb.HealthCheckRequest{})
+	c.setLatency(time.Since(start))
 	if err != nil {
-		return false, elapsed.Milliseconds(), err
+		c.recordFailure()
+		return false, c.GetLastLatency(), err
 	}
-	
-	return resp.Healthy, elapsed.Milliseconds(), nil
+	if !resp.GetHealthy() {
+		c.recordFailure()
+		return false, c.GetLastLatency(), fmt.Errorf("Brain reports unhealthy")
+	}
+	c.recordSuccess()
+	return true, c.GetLastLatency(), nil
 }

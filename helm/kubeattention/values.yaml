@@ -4,7 +4,7 @@
 # Global settings
 namespace: kubeattention
 
-# Brain (Python gRPC server with Transformer model)
+# Brain (Python gRPC scoring server)
 brain:
   enabled: true
   replicaCount: 1
@@ -12,6 +12,8 @@ brain:
     repository: kubeattention/brain
     tag: latest
     pullPolicy: IfNotPresent
+  grpcPort: 50051
+  modelType: mlp
   resources:
     requests:
       cpu: "500m"
@@ -46,16 +48,19 @@ collector:
 
 # Training job configuration
 training:
-  enabled: true
+  enabled: false
   image:
     repository: kubeattention/brain
     tag: latest
+    pullPolicy: IfNotPresent
   schedule: "0 2 * * *"  # Daily at 2 AM
   epochs: 50
   batchSize: 32
   learningRate: 0.0001
   dataPath: /data/events.jsonl
+  validationDataPath: /data/validation.jsonl
   modelOutputPath: /models
+  model: mlp
   resources:
     requests:
       cpu: "2"
@@ -68,9 +73,19 @@ training:
 scheduler:
   enabled: true
   name: kubeattention-scheduler
-  shadowMode: true
-  brainTimeout: 50ms
-  fallbackStrategy: LeastAllocated
+  image:
+    repository: kubeattention/scheduler
+    tag: latest
+    pullPolicy: IfNotPresent
+  mode: shadow
+  timeoutMs: 50
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "1"
+      memory: "512Mi"
 
 # Persistent volume for training data
 persistence:
@@ -81,19 +96,12 @@ persistence:
 
 # Grafana dashboard
 grafana:
-  enabled: true
+  enabled: false
   dashboard:
-    enabled: true
+    enabled: false
     label: grafana_dashboard
     labelValue: "1"
 
-# Prometheus metrics
-prometheus:
-  enabled: true
-  serviceMonitor:
-    enabled: true
-    interval: 15s
-    scrapeTimeout: 10s
 
 # Service account
 serviceAccount:
@@ -106,6 +114,18 @@ podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
   fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+rebalancer:
+  enabled: false
 
 # Node selector for Brain pod
 nodeSelector: {}

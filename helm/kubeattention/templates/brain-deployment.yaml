@@ -12,14 +12,17 @@ spec:
   selector:
     matchLabels:
       app: brain
+      app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
         app: brain
         {{- include "kubeattention.labels" . | nindent 8 }}
+      {{- if .Values.brain.metrics.enabled }}
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "{{ .Values.brain.metrics.port }}"
+      {{- end }}
     spec:
       serviceAccountName: {{ include "kubeattention.serviceAccountName" . }}
       securityContext:
@@ -28,6 +31,8 @@ spec:
         - name: brain
           image: "{{ .Values.brain.image.repository }}:{{ .Values.brain.image.tag }}"
           imagePullPolicy: {{ .Values.brain.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           command:
             - python
             - -m
@@ -35,14 +40,27 @@ spec:
             - --socket
             - {{ .Values.brain.udsPath }}
           ports:
+            - name: grpc
+              containerPort: {{ .Values.brain.grpcPort }}
+              protocol: TCP
+            {{- if .Values.brain.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.brain.metrics.port }}
               protocol: TCP
+            {{- end }}
           env:
             - name: MODEL_PATH
               value: {{ .Values.brain.modelPath }}
+            - name: MODEL_TYPE
+              value: {{ .Values.brain.modelType | quote }}
+            - name: BRAIN_TCP_PORT
+              value: "{{ .Values.brain.grpcPort }}"
+            {{- if .Values.brain.metrics.enabled }}
             - name: METRICS_PORT
               value: "{{ .Values.brain.metrics.port }}"
+            {{- end }}
+            - name: REBALANCER_ENABLED
+              value: {{ .Values.rebalancer.enabled | quote }}
           resources:
             {{- toYaml .Values.brain.resources | nindent 12 }}
           volumeMounts:
@@ -52,12 +70,22 @@ spec:
               mountPath: /models
             - name: training-data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import grpc, scheduler_pb2, scheduler_pb2_grpc; scheduler_pb2_grpc.BrainStub(grpc.insecure_channel('localhost:{{ .Values.brain.grpcPort }}')).HealthCheck(scheduler_pb2.HealthCheckRequest(), timeout=1)"
+            periodSeconds: 5
+            failureThreshold: 60
           readinessProbe:
             exec:
               command:
                 - python
                 - -c
-                - "import grpc; ch = grpc.insecure_channel('unix://{{ .Values.brain.udsPath }}'); print('ready')"
+                - "import grpc, scheduler_pb2, scheduler_pb2_grpc, sys; r = scheduler_pb2_grpc.BrainStub(grpc.insecure_channel('localhost:{{ .Values.brain.grpcPort }}')).HealthCheck(scheduler_pb2.HealthCheckRequest(), timeout=1); sys.exit(0 if r.healthy else 1)"
             initialDelaySeconds: 10
             periodSeconds: 5
           livenessProbe:
@@ -65,11 +93,13 @@ spec:
               command:
                 - python
                 - -c
-                - "import grpc; ch = grpc.insecure_channel('unix://{{ .Values.brain.udsPath }}'); print('alive')"
+                - "import grpc, scheduler_pb2, scheduler_pb2_grpc; scheduler_pb2_grpc.BrainStub(grpc.insecure_channel('localhost:{{ .Values.brain.grpcPort }}')).HealthCheck(scheduler_pb2.HealthCheckRequest(), timeout=1)"
             initialDelaySeconds: 30
             periodSeconds: 10
       volumes:
         - name: socket-dir
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
         - name: models
           persistentVolumeClaim:

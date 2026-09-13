@@ -5,7 +5,7 @@ import grpc
 import scheduler_pb2 as scheduler__pb2
 
 
-class BrainStub(object):
+class BrainStub:
     """Brain service provides inference for node scoring
     """
 
@@ -32,7 +32,7 @@ class BrainStub(object):
                 _registered_method=True)
 
 
-class BrainServicer(object):
+class BrainServicer:
     """Brain service provides inference for node scoring
     """
 
@@ -83,7 +83,7 @@ def add_BrainServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Brain(object):
+class Brain:
     """Brain service provides inference for node scoring
     """
 

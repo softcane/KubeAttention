@@ -12,10 +12,9 @@ import numpy as np
 
 @dataclass
 class ScoringResult:
-    """Result from a scoring operation."""
+    """Absolute node quality score: 0 is worst and 100 is best."""
     node_name: str
-    score: int  # 0-100
-    confidence: float  # 0-1
+    score: int
     reasoning: str
 
 
@@ -89,6 +88,15 @@ class BaseScorer(ABC):
     def num_parameters(self) -> int:
         """Number of trainable parameters (0 for tree models)."""
         pass
+
+    @property
+    def ready(self) -> bool:
+        """Whether a compatible trained checkpoint is loaded."""
+        return False
+
+    def predict_quality(self, features: np.ndarray) -> np.ndarray:
+        """Predict absolute quality in [0, 1] for complete model inputs."""
+        raise NotImplementedError
 
 
 def generate_reasoning(node_name: str, score: int, features: np.ndarray) -> str:

@@ -16,9 +16,14 @@ import numpy as np
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from brain.models import get_model, list_models
-from brain.training.dataset import SchedulingDataset, create_dataloader
 from brain.config import MODEL_SELECTION
+from brain.metrics_schema import (
+    FEATURE_DIM,
+    FEATURE_SCHEMA_VERSION,
+    REQUIRED_FEATURE_NAMES,
+)
+from brain.models import get_model, list_models
+from brain.training.dataset import SchedulingDataset
 
 
 @dataclass
@@ -45,42 +50,77 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints"
 
 
-def prepare_training_data(data_path: str) -> tuple:
-    """Load and prepare training data from JSONL."""
-    from brain.metrics_schema import FEATURE_NAMES
-    
+def prepare_training_data(data_path: str, require_measured: bool = False) -> tuple:
+    """Load model inputs and optionally require measured cluster outcomes."""
     dataset = SchedulingDataset(data_path)
-    
+    if not dataset.events:
+        raise ValueError(f"no completed scheduling events in {data_path}")
+    if require_measured:
+        invalid_evidence = []
+        incomplete_telemetry = []
+        for event in dataset.events:
+            event_id = event.get("event_id", event.get("pod_name", "unknown"))
+            if event.get("evidence_source") != "measured":
+                invalid_evidence.append(event_id)
+                continue
+            candidate_nodes = event.get("candidate_nodes") or []
+            telemetry = event.get("node_telemetry") or {}
+            for node_name in candidate_nodes:
+                sample = telemetry.get(node_name) or {}
+                available = set(sample.get("available_metrics") or [])
+                if not REQUIRED_FEATURE_NAMES.issubset(available):
+                    incomplete_telemetry.append(event_id)
+                    break
+        if invalid_evidence:
+            raise ValueError(
+                f"validation data contains {len(invalid_evidence)} events without "
+                "evidence_source='measured'"
+            )
+        if incomplete_telemetry:
+            raise ValueError(
+                f"validation data contains {len(incomplete_telemetry)} events without "
+                "complete required interference measurements"
+            )
+
     X_list = []
     y_list = []
-    w_list = []
-    
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        num_nodes = sample["num_nodes"].item()
-        
-        # Node features: use last timestep
-        node_feats = sample["node_features"][:num_nodes, -1, :].numpy()  # (N, F)
-        
-        # Pod context features: broadcast to all nodes
-        pod_ctx = sample["pod_context"].numpy()  # (P,)
-        pod_broadcast = np.tile(pod_ctx, (num_nodes, 1))  # (N, P)
-        
-        # Concatenate node features with pod context for full input
-        combined_feats = np.hstack([node_feats, pod_broadcast])  # (N, F+P)
-        
-        labels = sample["labels"][:num_nodes].numpy()
-        weight = sample["weight"].item()
-        
-        X_list.append(combined_feats)
-        y_list.append(labels)
-        w_list.extend([weight] * num_nodes)
-    
-    X = np.vstack(X_list)
-    y = np.concatenate(y_list)
-    w = np.array(w_list)
-    
-    return X, y, w
+    weights = []
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        node_count = sample["num_nodes"].item()
+        if node_count == 0:
+            continue
+        node_features = sample["node_features"][:node_count, -1, :].numpy()
+        pod_features = sample["pod_context"].numpy()
+        combined = np.hstack([
+            node_features,
+            np.broadcast_to(pod_features, (node_count, pod_features.shape[0])),
+        ])
+        X_list.append(combined)
+        y_list.append(sample["labels"][:node_count].numpy())
+        weights.extend([sample["weight"].item()] * node_count)
+    if not X_list:
+        raise ValueError(f"no candidate node telemetry in {data_path}")
+    return np.vstack(X_list), np.concatenate(y_list), np.asarray(weights)
+
+
+def evaluate_promotion(model, X_val: np.ndarray, y_val: np.ndarray, minimum_improvement: float) -> dict:
+    """Compare held-out model quality with the non-ML resource-pressure rule."""
+    predictions = model.predict_quality(X_val)
+    cpu = X_val[:, 0]
+    memory = X_val[:, 2]
+    cache_miss = X_val[:, 4]
+    baseline = (1.0 - cpu) * 0.4 + (1.0 - memory) * 0.4 + (1.0 - cache_miss) * 0.2
+    model_mse = float(np.mean((predictions - y_val) ** 2))
+    baseline_mse = float(np.mean((baseline - y_val) ** 2))
+    threshold = baseline_mse * (1.0 - minimum_improvement)
+    return {
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "held_out_model_mse": model_mse,
+        "held_out_baseline_mse": baseline_mse,
+        "minimum_relative_improvement": minimum_improvement,
+        "promoted": model_mse < threshold,
+    }
 
 
 
@@ -115,10 +155,10 @@ def train_model(
     print(f"  Samples: {len(X_train):,}")
     print(f"  Features: {X_train.shape[1]}")
     
-    X_val, y_val = None, None
-    if val_data_path:
-        X_val, y_val, _ = prepare_training_data(val_data_path)
-        print(f"  Validation samples: {len(X_val):,}")
+    if not val_data_path:
+        raise ValueError("a held-out measured validation data set is required")
+    X_val, y_val, _ = prepare_training_data(val_data_path, require_measured=True)
+    print(f"  Validation samples: {len(X_val):,}")
     
     # Initialize model with correct input dimension
     input_dim = X_train.shape[1]
@@ -143,29 +183,38 @@ def train_model(
             batch_size=kwargs.get("batch_size", 32),
         )
     else:
-        eval_set = (X_val, y_val) if X_val is not None else None
-        metrics = model.train(X_train, y_train, weights=w_train, eval_set=eval_set)
+        metrics = model.train(
+            X_train, y_train, weights=w_train, eval_set=(X_val, y_val)
+        )
     
     elapsed = time.perf_counter() - start_time
     print(f"Training complete in {elapsed:.1f}s")
     
-    # Save model
-    model_ext = ".pt" if model_type == "mlp" else ".json"
-    model_path = os.path.join(output_dir, f"best_model{model_ext}")
-    model.save(model_path)
-    print(f"Model saved to: {model_path}")
-    
-    # Save training results
+    promotion = evaluate_promotion(
+        model,
+        X_val,
+        y_val,
+        minimum_improvement=kwargs.get("minimum_improvement", 0.01),
+    )
     results = {
         "model_type": model_type,
         "num_samples": len(X_train),
         "elapsed_seconds": elapsed,
         **metrics,
+        **promotion,
     }
     results_path = os.path.join(output_dir, "training_results.json")
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    
+    with open(results_path, "w") as results_file:
+        json.dump(results, results_file, indent=2)
+    if not promotion["promoted"]:
+        raise RuntimeError(
+            "model promotion rejected: held-out model MSE did not beat the baseline"
+        )
+
+    model_ext = ".pt" if model_type == "mlp" else ".json"
+    model_path = os.path.join(output_dir, f"best_model{model_ext}")
+    model.save(model_path)
+    print(f"Promoted model saved to: {model_path}")
     return model_path
 
 
@@ -174,7 +223,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Train KubeAttention model")
     parser.add_argument("--train-data", required=True, help="Path to training data")
-    parser.add_argument("--val-data", help="Path to validation data")
+    parser.add_argument("--val-data", required=True, help="Measured held-out JSONL data")
     parser.add_argument("--output-dir", default="checkpoints", help="Output directory")
     parser.add_argument("--model", default="mlp", choices=["mlp", "xgboost"],
                         help="Model type (default: mlp)")

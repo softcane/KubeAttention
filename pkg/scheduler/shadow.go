@@ -11,12 +11,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/client-go/kubernetes"
 )
 
 // ShadowModeConfig holds shadow mode configuration
@@ -43,17 +44,18 @@ type ShadowModeStats struct {
 	WorseByBrain       int64 // Times Brain's choice would have been worse
 }
 
-// ShadowAnnotator handles pod annotation in shadow mode
+// ShadowAnnotator handles pod annotation in shadow mode.
 type ShadowAnnotator struct {
-	handle framework.Handle
+	client kubernetes.Interface
 	config ShadowModeConfig
+	mu     sync.RWMutex
 	stats  ShadowModeStats
 }
 
-// NewShadowAnnotator creates a new shadow annotator
-func NewShadowAnnotator(h framework.Handle, config ShadowModeConfig) *ShadowAnnotator {
+// NewShadowAnnotator creates a new shadow annotator.
+func NewShadowAnnotator(client kubernetes.Interface, config ShadowModeConfig) *ShadowAnnotator {
 	return &ShadowAnnotator{
-		handle: h,
+		client: client,
 		config: config,
 	}
 }
@@ -73,7 +75,6 @@ func (sa *ShadowAnnotator) AnnotatePod(
 	annotations := map[string]string{
 		AnnotationRecommendedNode: recommendation.BestNode,
 		AnnotationScore:           fmt.Sprintf("%d", recommendation.Score),
-		AnnotationConfidence:      fmt.Sprintf("%.3f", recommendation.Confidence),
 		AnnotationReasoning:       recommendation.Reasoning,
 		"kubeattention.io/mode":   "shadow",
 		"kubeattention.io/time":   time.Now().UTC().Format(time.RFC3339),
@@ -99,8 +100,7 @@ func (sa *ShadowAnnotator) AnnotatePod(
 		return fmt.Errorf("failed to marshal patch: %w", err)
 	}
 
-	// Apply patch
-	_, err = sa.handle.ClientSet().CoreV1().Pods(pod.Namespace).Patch(
+	_, err = sa.client.CoreV1().Pods(pod.Namespace).Patch(
 		ctx,
 		pod.Name,
 		types.MergePatchType,
@@ -111,34 +111,33 @@ func (sa *ShadowAnnotator) AnnotatePod(
 	return err
 }
 
-// RecordDecision records a scheduling decision for metrics
-func (sa *ShadowAnnotator) RecordDecision(
-	recommendedNode string,
-	actualNode string,
-) {
+// RecordDecision records a scheduling decision for metrics.
+func (sa *ShadowAnnotator) RecordDecision(recommendedNode, actualNode string) {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
 	sa.stats.TotalDecisions++
-
 	if recommendedNode == actualNode {
 		sa.stats.MatchingDecisions++
-	} else {
-		sa.stats.DifferentDecisions++
-
-		if sa.config.LogDecisionDiff {
-			fmt.Printf("🔍 Shadow Mode: Brain recommended %s, but scheduler chose %s\n",
-				recommendedNode, actualNode)
-		}
+		return
+	}
+	sa.stats.DifferentDecisions++
+	if sa.config.LogDecisionDiff {
+		fmt.Printf("KubeAttention shadow differs: recommended=%s actual=%s\n", recommendedNode, actualNode)
 	}
 }
 
-// GetStats returns current shadow mode statistics
+// GetStats returns current shadow mode statistics.
 func (sa *ShadowAnnotator) GetStats() ShadowModeStats {
+	sa.mu.RLock()
+	defer sa.mu.RUnlock()
 	return sa.stats
 }
 
-// MatchRate returns the percentage of matching decisions
+// MatchRate returns the percentage of matching decisions.
 func (sa *ShadowAnnotator) MatchRate() float64 {
-	if sa.stats.TotalDecisions == 0 {
+	stats := sa.GetStats()
+	if stats.TotalDecisions == 0 {
 		return 0
 	}
-	return float64(sa.stats.MatchingDecisions) / float64(sa.stats.TotalDecisions) * 100
+	return float64(stats.MatchingDecisions) / float64(stats.TotalDecisions) * 100
 }

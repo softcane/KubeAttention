@@ -41,20 +41,10 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
         
-        # Sidecar to continuously measure P99 latency
+        # Probe container used by benchmark/runner.py for real redis-benchmark calls.
         - name: latency-probe
           image: redis:7-alpine
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              while true; do
-                START=$(date +%s%N)
-                redis-cli -h localhost PING > /dev/null 2>&1
-                END=$(date +%s%N)
-                LATENCY=$(( (END - START) / 1000000 ))
-                echo "latency_ms=$LATENCY"
-                sleep 0.1
-              done
+          command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
           resources:
             requests:
               cpu: "50m"

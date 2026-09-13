@@ -14,119 +14,135 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	schedulerpb "github.com/softcane/KubeAttention/gen/go"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kube-scheduler/framework"
+	"sigs.k8s.io/yaml"
 )
 
 const (
-	// PluginName is the name of this scheduler plugin
 	PluginName = "KubeAttention"
 
-	// AnnotationRecommendedNode is set in shadow mode
 	AnnotationRecommendedNode = "kubeattention.io/recommended-node"
+	AnnotationScore           = "kubeattention.io/score"
+	AnnotationReasoning       = "kubeattention.io/reasoning"
 
-	// AnnotationScore is the Brain's score for the recommended node
-	AnnotationScore = "kubeattention.io/score"
-
-	// AnnotationConfidence is the Brain's confidence
-	AnnotationConfidence = "kubeattention.io/confidence"
-
-	// AnnotationReasoning explains the score
-	AnnotationReasoning = "kubeattention.io/reasoning"
+	SchedulerModeShadow = "shadow"
+	SchedulerModeActive = "active"
 )
 
-// KubeAttentionArgs holds the configuration for the plugin
+// KubeAttentionArgs holds the configuration for the plugin.
 type KubeAttentionArgs struct {
-	// UDSPath is the Unix Domain Socket path for Brain communication
-	UDSPath string `json:"udsPath,omitempty"`
-
-	// TimeoutMs is the maximum time to wait for Brain response (default: 50)
-	TimeoutMs int `json:"timeoutMs,omitempty"`
-
-	// ShadowMode when true, only annotates pods without affecting scheduling
-	ShadowMode bool `json:"shadowMode,omitempty"`
-
-	// FallbackScore to use when Brain is unavailable (default: 50)
-	FallbackScore int64 `json:"fallbackScore,omitempty"`
+	BrainEndpoint string `json:"brainEndpoint,omitempty"`
+	TimeoutMs     int    `json:"timeoutMs,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	FallbackScore int64  `json:"fallbackScore,omitempty"`
 }
 
-// SetDefaults sets default values for KubeAttentionArgs
+// SetDefaults applies fail-safe scheduler defaults.
 func (args *KubeAttentionArgs) SetDefaults() {
-	if args.UDSPath == "" {
-		args.UDSPath = DefaultUDSPath
+	if args.BrainEndpoint == "" {
+		args.BrainEndpoint = DefaultUDSPath
 	}
 	if args.TimeoutMs <= 0 {
 		args.TimeoutMs = 50
 	}
+	if args.Mode == "" {
+		args.Mode = SchedulerModeShadow
+	}
 	if args.FallbackScore <= 0 {
 		args.FallbackScore = 50
 	}
-	// Shadow mode defaults to true as per PLAN.md
-	// This is already the zero value for bool, but being explicit
+}
+
+func (args *KubeAttentionArgs) validate() error {
+	if args.Mode != SchedulerModeShadow && args.Mode != SchedulerModeActive {
+		return fmt.Errorf("mode must be %q or %q", SchedulerModeShadow, SchedulerModeActive)
+	}
+	if args.FallbackScore < framework.MinNodeScore || args.FallbackScore > framework.MaxNodeScore {
+		return fmt.Errorf("fallbackScore must be between %d and %d", framework.MinNodeScore, framework.MaxNodeScore)
+	}
+	return nil
+}
+
+func (args *KubeAttentionArgs) shadowMode() bool {
+	return args.Mode == SchedulerModeShadow
 }
 
 type KubeAttention struct {
-	handle         framework.Handle
-	args           *KubeAttentionArgs
-	brainClient    *BrainClient
-	telemetryStore *TelemetryStore
-	tetragonClient *TetragonClient
-	mu             sync.RWMutex
+	handle          framework.Handle
+	args            *KubeAttentionArgs
+	brainClient     *BrainClient
+	telemetryStore  *TelemetryStore
+	shadowAnnotator *ShadowAnnotator
+	mu              sync.RWMutex
 }
 
-var _ framework.PreScorePlugin = &KubeAttention{} // Implementing PreScore for batching
+var _ framework.PreScorePlugin = &KubeAttention{}
 var _ framework.ScorePlugin = &KubeAttention{}
 var _ framework.ScoreExtensions = &KubeAttention{}
 var _ framework.PreEnqueuePlugin = &KubeAttention{}
+var _ framework.PostBindPlugin = &KubeAttention{}
 
-// New creates a new KubeAttention plugin
-func New(obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
+// New creates a KubeAttention scheduler plugin.
+func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 	args := &KubeAttentionArgs{}
-
-	if obj != nil {
-		if err := framework.DecodeInto(obj, args); err != nil {
-			return nil, fmt.Errorf("failed to decode KubeAttentionArgs: %w", err)
-		}
+	if err := decodeArgs(obj, args); err != nil {
+		return nil, fmt.Errorf("decode KubeAttention arguments: %w", err)
 	}
-
 	args.SetDefaults()
-
-	// Create Singleton Tetragon Client
-	tetragon := NewTetragonClient("", "")
-
-	// Create Telemetry Store for background collection
-	telemetryStore := NewTelemetryStore(tetragon, 1*time.Second)
-
-	// Create Brain client
-	client, err := NewBrainClient(args.UDSPath, DefaultTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Brain client: %w", err)
+	if err := args.validate(); err != nil {
+		return nil, err
 	}
 
-	// Connect to Brain (non-blocking) and start background store
+	nodeLister := h.SharedInformerFactory().Core().V1().Nodes().Lister()
+	metricsSource, err := NewKubernetesMetricsSource(h.KubeConfig(), nodeLister)
+	if err != nil {
+		return nil, err
+	}
+	telemetryStore := NewTelemetryStore(metricsSource, nodeLister, time.Second)
+	client, err := NewBrainClient(args.BrainEndpoint, time.Duration(args.TimeoutMs)*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("create Brain client: %w", err)
+	}
+
+	telemetryStore.Start(ctx)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout*10)
+		connectCtx, cancel := context.WithTimeout(ctx, time.Duration(args.TimeoutMs)*time.Millisecond)
 		defer cancel()
-		_ = client.Connect(ctx)
-
-		// Start background telemetry collection for all nodes
-		// In a real K8s plugin, we would use an informer to get the list of nodes
-		// For now, we start with nil and let updateAll handle dynamic discovery or
-		// wait for first PreScore to populate node list.
-		telemetryStore.Start(context.Background(), nil)
+		_ = client.Connect(connectCtx)
 	}()
-
-	return &KubeAttention{
+	plugin := &KubeAttention{
 		handle:         h,
 		args:           args,
 		brainClient:    client,
 		telemetryStore: telemetryStore,
-		tetragonClient: tetragon,
-	}, nil
+	}
+	plugin.shadowAnnotator = NewShadowAnnotator(h.ClientSet(), ShadowModeConfig{
+		Enabled:         args.shadowMode(),
+		LogDecisionDiff: true,
+		AnnotatePods:    true,
+	})
+	return plugin, nil
+}
+
+func decodeArgs(obj runtime.Object, args *KubeAttentionArgs) error {
+	if obj == nil {
+		return nil
+	}
+	unknown, ok := obj.(*runtime.Unknown)
+	if !ok {
+		return fmt.Errorf("expected *runtime.Unknown, got %T", obj)
+	}
+	if len(unknown.Raw) == 0 {
+		return nil
+	}
+	return yaml.Unmarshal(unknown.Raw, args)
 }
 
 // Name returns the plugin name
@@ -134,112 +150,130 @@ func (ka *KubeAttention) Name() string {
 	return PluginName
 }
 
-// batchResultKey is the key for storing BatchScore results in CycleState
-type batchResultKey struct{}
+const batchResultKey framework.StateKey = "kubeattention.io/batch-results"
+
+type batchResultState struct {
+	scores map[string]*schedulerpb.NodeScore
+}
+
+func (s *batchResultState) Clone() framework.StateData {
+	scores := make(map[string]*schedulerpb.NodeScore, len(s.scores))
+	for nodeName, score := range s.scores {
+		if score == nil {
+			continue
+		}
+		scoreCopy := *score
+		scores[nodeName] = &scoreCopy
+	}
+	return &batchResultState{scores: scores}
+}
 
 // PreScore implements the PreScore plugin interface.
 // It collects telemetry for ALL nodes and calls BatchScore ONCE per pod,
 // significantly reducing latency and gRPC overhead.
 func (ka *KubeAttention) PreScore(
 	ctx context.Context,
-	state *framework.CycleState,
+	state framework.CycleState,
 	pod *v1.Pod,
-	nodes []*v1.Node,
+	nodes []framework.NodeInfo,
 ) *framework.Status {
 	if len(nodes) == 0 {
-		return framework.NewStatus(framework.Success)
+		return nil
 	}
 
-	// Build BatchScore request
-	req := &BatchScoreRequest{
-		PodName:      pod.Name,
-		PodNamespace: pod.Namespace,
-		Nodes:        make([]ScoreRequest, len(nodes)),
+	req := &schedulerpb.BatchScoreRequest{
+		PodRequirements: podRequirements(pod),
+		Nodes:           make([]*schedulerpb.NodeTelemetry, 0, len(nodes)),
 	}
-
-	for i, node := range nodes {
-		// Get telemetry from background TelemetryStore (FAST/NO NETWORK)
+	activeTelemetryReady := true
+	now := time.Now()
+	for _, nodeInfo := range nodes {
+		node := nodeInfo.Node()
+		if node == nil {
+			continue
+		}
 		metrics := ka.telemetryStore.GetMetrics(node.Name)
-		var telemetry map[string]float64
-		if metrics != nil {
-			telemetry = metrics.ToTelemetryMap()
-		} else {
-			// Fallback: limited K8s-only telemetry if background store hasn't caught up
-			telemetry = ka.collectNodeTelemetryFallback(node)
+		if !metrics.ActiveScoringReady(now, 30*time.Second) {
+			activeTelemetryReady = false
 		}
-
-		req.Nodes[i] = ScoreRequest{
-			PodName:      pod.Name,
-			PodNamespace: pod.Namespace,
-			NodeName:     node.Name,
-			Telemetry:    telemetry,
-		}
+		req.Nodes = append(req.Nodes, nodeTelemetry(node, metrics))
 	}
 
-	// Call Brain BatchScore (ONE network call for all nodes)
+	if !ka.args.shadowMode() && !activeTelemetryReady {
+		nodeScores := make(map[string]*schedulerpb.NodeScore, len(req.GetNodes()))
+		for _, node := range req.GetNodes() {
+			nodeScores[node.GetNodeName()] = &schedulerpb.NodeScore{
+				NodeName:  node.GetNodeName(),
+				Score:     ka.args.FallbackScore,
+				Reasoning: "active scoring disabled: required interference telemetry unavailable or stale",
+			}
+		}
+		state.Write(batchResultKey, &batchResultState{scores: nodeScores})
+		return nil
+	}
+
 	resp, err := ka.brainClient.BatchScore(ctx, req)
 	if err != nil {
-		// Fail silently, Score() will handle fallback
-		return framework.NewStatus(framework.Success)
+		return nil
 	}
 
-	// Store results in CycleState for use in Score()
-	nodeScores := make(map[string]NodeScore)
-	for _, s := range resp.Scores {
-		nodeScores[s.NodeName] = s
+	nodeScores := make(map[string]*schedulerpb.NodeScore, len(resp.GetScores()))
+	for _, score := range resp.GetScores() {
+		if score != nil {
+			nodeScores[score.GetNodeName()] = score
+		}
 	}
-	state.Write(batchResultKey{}, nodeScores)
-
-	return framework.NewStatus(framework.Success)
+	state.Write(batchResultKey, &batchResultState{scores: nodeScores})
+	return nil
 }
 
 // Score scores a node for pod placement by looking up the pre-computed batch result
 func (ka *KubeAttention) Score(
-	ctx context.Context,
-	state *framework.CycleState,
-	pod *v1.Pod,
-	nodeName string,
+	_ context.Context,
+	state framework.CycleState,
+	_ *v1.Pod,
+	nodeInfo framework.NodeInfo,
 ) (int64, *framework.Status) {
-	// Lookup batch result from CycleState
-	data, err := state.Read(batchResultKey{})
+	node := nodeInfo.Node()
+	if node == nil {
+		return ka.args.FallbackScore, nil
+	}
+	data, err := state.Read(batchResultKey)
 	if err != nil {
-		// Fallback if PreScore failed or didn't run
-		return ka.args.FallbackScore, framework.NewStatus(framework.Success)
+		return ka.args.FallbackScore, nil
 	}
-
-	nodeScores := data.(map[string]NodeScore)
-	res, ok := nodeScores[nodeName]
+	results, ok := data.(*batchResultState)
 	if !ok {
-		return ka.args.FallbackScore, framework.NewStatus(framework.Success)
+		return ka.args.FallbackScore, nil
+	}
+	res, ok := results.scores[node.Name]
+	if !ok {
+		return ka.args.FallbackScore, nil
 	}
 
-	// If in shadow mode, store the recommendation but return neutral score
-	if ka.args.ShadowMode {
-		ka.storeRecommendation(state, nodeName, &res)
-		return 50, framework.NewStatus(framework.Success)
+	if ka.args.shadowMode() {
+		ka.storeRecommendation(state, node.Name, res)
+		return ka.args.FallbackScore, nil
 	}
-
-	return res.Score, framework.NewStatus(framework.Success)
+	return res.GetScore(), nil
 }
 
 // NormalizeScore normalizes scores to [0, 100] range
 func (ka *KubeAttention) NormalizeScore(
-	ctx context.Context,
-	state *framework.CycleState,
-	pod *v1.Pod,
+	_ context.Context,
+	_ framework.CycleState,
+	_ *v1.Pod,
 	scores framework.NodeScoreList,
 ) *framework.Status {
-	// Brain already returns scores in 0-100 range
-	// Just ensure bounds
 	for i := range scores {
-		if scores[i].Score > 100 {
-			scores[i].Score = 100
+		if scores[i].Score > framework.MaxNodeScore {
+			scores[i].Score = framework.MaxNodeScore
 		}
-		if scores[i].Score < 0 {
-			scores[i].Score = 0
+		if scores[i].Score < framework.MinNodeScore {
+			scores[i].Score = framework.MinNodeScore
 		}
 	}
-	return framework.NewStatus(framework.Success)
+	return nil
 }
 
 // ScoreExtensions returns the score extensions
@@ -247,105 +281,188 @@ func (ka *KubeAttention) ScoreExtensions() framework.ScoreExtensions {
 	return ka
 }
 
-// collectNodeTelemetryFallback gathers basic K8s metrics when TelemetryStore is not yet populated.
-// NO external network calls are allowed here.
-func (ka *KubeAttention) collectNodeTelemetryFallback(node *v1.Node) map[string]float64 {
-	// All 15 eBPF metrics must be present to match Python model's FEATURE_NAMES
-	return map[string]float64{
-		"cpu_utilization":        0.5, // Conservative estimate
-		"memory_utilization":     0.5,
-		"l3_cache_miss_rate":     0.0,
-		"disk_io_wait_ms":        0.0,
-		"network_drop_rate":      0.0,
-		"cpu_throttle_rate":      0.0,
-		"memory_bandwidth_gbps":  0.0,
-		"l3_cache_occupancy_mb":  0.0,
-		"disk_iops":              0.0,
-		"network_rx_packets_sec": 0.0,
-		"network_tx_packets_sec": 0.0,
-		"node_cost_index":        0.1, // Default cost index
-		"zone_diversity_score":   0.5, // Neutral zone score
-		"spot_interruption_risk": 0.0, // Assume on-demand by default
-		"is_spot_instance":       0.0, // Boolean: not spot
+const FeatureSchemaVersion = "node-pod-v1"
+
+func nodeTelemetry(node *v1.Node, metrics *NodeMetrics) *schedulerpb.NodeTelemetry {
+	telemetry := &schedulerpb.NodeTelemetry{
+		NodeName:          node.Name,
+		AvailabilityZone:  node.Labels[v1.LabelTopologyZone],
+		RackId:            node.Labels["topology.kubeattention.io/rack"],
+		IsSpotInstance:    node.Labels["kubernetes.io/lifecycle"] == "spot" || node.Labels["karpenter.sh/capacity-type"] == "spot",
+		SchemaVersion:     FeatureSchemaVersion,
+		DegradationReason: "node telemetry unavailable",
+	}
+	if metrics == nil {
+		return telemetry
+	}
+	telemetry.TimestampUnixMs = metrics.Timestamp.UnixMilli()
+	telemetry.ObservationWindowMs = metrics.Window.Milliseconds()
+	telemetry.TelemetrySource = metrics.Source
+	telemetry.DegradationReason = metrics.DegradationReason
+	telemetry.CpuUtilization = metrics.CPUUtilization
+	telemetry.CpuThrottleRate = metrics.CPUThrottleRate
+	telemetry.MemoryUtilization = metrics.MemoryUtilization
+	telemetry.MemoryBandwidthGbps = metrics.MemoryBandwidthGbps
+	telemetry.L3CacheMissRate = metrics.L3CacheMissRate
+	telemetry.L3CacheOccupancyMb = metrics.L3CacheOccupancyMB
+	telemetry.DiskIoWaitMs = metrics.DiskIOWaitMs
+	telemetry.DiskIops = metrics.DiskIOPS
+	telemetry.NetworkRxPacketsSec = metrics.NetworkRxPacketsSec
+	telemetry.NetworkTxPacketsSec = metrics.NetworkTxPacketsSec
+	telemetry.NetworkDropRate = metrics.NetworkDropRate
+	telemetry.AvailableMetrics = availableProtoMetrics(metrics.Available)
+	return telemetry
+}
+
+func availableProtoMetrics(available MetricSet) []schedulerpb.NodeMetric {
+	metrics := make([]schedulerpb.NodeMetric, 0, 11)
+	candidates := []struct {
+		flag   MetricSet
+		metric schedulerpb.NodeMetric
+	}{
+		{MetricCPUUtilization, schedulerpb.NodeMetric_NODE_METRIC_CPU_UTILIZATION},
+		{MetricCPUThrottleRate, schedulerpb.NodeMetric_NODE_METRIC_CPU_THROTTLE_RATE},
+		{MetricMemoryUtilization, schedulerpb.NodeMetric_NODE_METRIC_MEMORY_UTILIZATION},
+		{MetricMemoryBandwidth, schedulerpb.NodeMetric_NODE_METRIC_MEMORY_BANDWIDTH},
+		{MetricL3CacheMissRate, schedulerpb.NodeMetric_NODE_METRIC_L3_CACHE_MISS_RATE},
+		{MetricL3CacheOccupancy, schedulerpb.NodeMetric_NODE_METRIC_L3_CACHE_OCCUPANCY},
+		{MetricDiskIOWait, schedulerpb.NodeMetric_NODE_METRIC_DISK_IO_WAIT},
+		{MetricDiskIOPS, schedulerpb.NodeMetric_NODE_METRIC_DISK_IOPS},
+		{MetricNetworkRXPackets, schedulerpb.NodeMetric_NODE_METRIC_NETWORK_RX_PACKETS},
+		{MetricNetworkTXPackets, schedulerpb.NodeMetric_NODE_METRIC_NETWORK_TX_PACKETS},
+		{MetricNetworkDropRate, schedulerpb.NodeMetric_NODE_METRIC_NETWORK_DROP_RATE},
+	}
+	for _, candidate := range candidates {
+		if available.Has(candidate.flag) {
+			metrics = append(metrics, candidate.metric)
+		}
+	}
+	return metrics
+}
+
+func podRequirements(pod *v1.Pod) *schedulerpb.PodRequirements {
+	var cpuMilli, memoryBytes int64
+	for _, container := range pod.Spec.Containers {
+		cpuMilli += container.Resources.Requests.Cpu().MilliValue()
+		memoryBytes += container.Resources.Requests.Memory().Value()
+	}
+	var initCPU, initMemory int64
+	for _, container := range pod.Spec.InitContainers {
+		if value := container.Resources.Requests.Cpu().MilliValue(); value > initCPU {
+			initCPU = value
+		}
+		if value := container.Resources.Requests.Memory().Value(); value > initMemory {
+			initMemory = value
+		}
+	}
+	if initCPU > cpuMilli {
+		cpuMilli = initCPU
+	}
+	if initMemory > memoryBytes {
+		memoryBytes = initMemory
+	}
+	if pod.Spec.Overhead != nil {
+		cpuMilli += pod.Spec.Overhead.Cpu().MilliValue()
+		memoryBytes += pod.Spec.Overhead.Memory().Value()
+	}
+
+	criticality := schedulerpb.Criticality_CRITICALITY_UNKNOWN
+	switch strings.ToLower(pod.Annotations["kubeattention.io/criticality"]) {
+	case "low":
+		criticality = schedulerpb.Criticality_CRITICALITY_LOW
+	case "medium":
+		criticality = schedulerpb.Criticality_CRITICALITY_MEDIUM
+	case "high":
+		criticality = schedulerpb.Criticality_CRITICALITY_HIGH
+	}
+	var priority int32
+	if pod.Spec.Priority != nil {
+		priority = *pod.Spec.Priority
+	}
+	return &schedulerpb.PodRequirements{
+		PodName:      pod.Name,
+		PodNamespace: pod.Namespace,
+		CpuMilli:     cpuMilli,
+		MemoryBytes:  memoryBytes,
+		WorkloadType: pod.Labels["kubeattention.io/workload-type"],
+		Labels:       pod.Labels,
+		Criticality:  criticality,
+		Priority:     priority,
 	}
 }
 
-// shadowRecommendationKey is the key for storing shadow mode recommendations
-type shadowRecommendationKey struct{}
+const shadowRecommendationKey framework.StateKey = "kubeattention.io/shadow-recommendation"
 
 // ShadowRecommendation holds the Brain's recommendation in shadow mode
 type ShadowRecommendation struct {
-	BestNode   string
-	Score      int64
-	Confidence float64
-	Reasoning  string
+	BestNode  string
+	Score     int64
+	Reasoning string
 }
 
 // storeRecommendation stores a recommendation for shadow mode in a thread-safe way
 func (ka *KubeAttention) storeRecommendation(
-	state *framework.CycleState,
+	state framework.CycleState,
 	nodeName string,
-	resp *NodeScore,
+	resp *schedulerpb.NodeScore,
 ) {
 	ka.mu.Lock()
 	defer ka.mu.Unlock()
 
-	// Get or create recommendation
 	var rec *ShadowRecommendation
-	if data, err := state.Read(shadowRecommendationKey{}); err == nil {
-		rec = data.(*ShadowRecommendation)
-	} else {
+	if data, err := state.Read(shadowRecommendationKey); err == nil {
+		rec, _ = data.(*ShadowRecommendation)
+	}
+	if rec == nil {
 		rec = &ShadowRecommendation{}
 	}
-
-	// Update if this node has a higher score
 	if resp.Score > rec.Score {
 		rec.BestNode = nodeName
 		rec.Score = resp.Score
-		rec.Confidence = resp.Confidence
 		rec.Reasoning = resp.Reasoning
 	}
-
-	state.Write(shadowRecommendationKey{}, rec)
+	state.Write(shadowRecommendationKey, rec)
 }
 
 // Clone implements framework.StateData for ShadowRecommendation
 func (rec *ShadowRecommendation) Clone() framework.StateData {
 	return &ShadowRecommendation{
-		BestNode:   rec.BestNode,
-		Score:      rec.Score,
-		Confidence: rec.Confidence,
-		Reasoning:  rec.Reasoning,
+		BestNode:  rec.BestNode,
+		Score:     rec.Score,
+		Reasoning: rec.Reasoning,
 	}
 }
 
 // PostBind is called after a pod is bound - useful for shadow mode logging
 func (ka *KubeAttention) PostBind(
 	ctx context.Context,
-	state *framework.CycleState,
+	state framework.CycleState,
 	pod *v1.Pod,
 	nodeName string,
 ) {
-	if !ka.args.ShadowMode {
+	if !ka.args.shadowMode() {
 		return
 	}
 
-	// Get recommendation from state
 	ka.mu.RLock()
-	defer ka.mu.RUnlock()
-
-	if data, err := state.Read(shadowRecommendationKey{}); err == nil {
-		rec := data.(*ShadowRecommendation)
-		if rec.BestNode != "" {
-			// Log the recommendation vs actual decision
-			fmt.Printf("KubeAttention Shadow: pod=%s/%s actual=%s recommended=%s score=%d confidence=%.2f\n",
-				pod.Namespace, pod.Name, nodeName, rec.BestNode, rec.Score, rec.Confidence)
-
-			if rec.BestNode != nodeName {
-				fmt.Printf("  Decision differed! Reason: %s\n", rec.Reasoning)
-			}
-		}
+	data, err := state.Read(shadowRecommendationKey)
+	if err != nil {
+		ka.mu.RUnlock()
+		return
 	}
+	rec, ok := data.(*ShadowRecommendation)
+	if !ok || rec.BestNode == "" {
+		ka.mu.RUnlock()
+		return
+	}
+	recCopy := *rec
+	ka.mu.RUnlock()
+
+	if err := ka.shadowAnnotator.AnnotatePod(ctx, pod, &recCopy, nodeName); err != nil {
+		fmt.Printf("KubeAttention shadow annotation failed for %s/%s: %v\n", pod.Namespace, pod.Name, err)
+		return
+	}
+	ka.shadowAnnotator.RecordDecision(recCopy.BestNode, nodeName)
 }
 
 // PreEnqueue implements K8s 1.35+ Workload-Aware Scheduling.

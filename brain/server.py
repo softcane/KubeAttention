@@ -6,17 +6,19 @@ Implements the Brain service defined in scheduler.proto.
 """
 
 import asyncio
-import time
+from concurrent import futures
+import math
 import os
 import signal
-from concurrent import futures
+import sys
+import time
 from typing import Optional
 
 import grpc
 from grpc import aio
+import numpy as np
 
-# Import generated proto stubs - REQUIRED for production
-import sys
+# Import generated proto stubs.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'gen', 'python'))
 
 try:
@@ -30,12 +32,17 @@ except ImportError as e:
         f"Error: {e}"
     )
 
+from .config import INFERENCE, MODEL_SELECTION, TELEMETRY
+from .metrics_schema import (
+    FEATURE_SCHEMA_VERSION,
+    NODE_FEATURE_SCHEMA,
+    NodeMetricsSnapshot,
+    REQUIRED_PROTO_METRICS,
+)
 from .models import get_model
 from .models.base import BaseScorer
-from .tensor_encoder import ClusterTensorEncoder, ClusterTensor, PodContext
-from .metrics_schema import NodeMetricsSnapshot
-from .config import INFERENCE, TELEMETRY, MODEL_SELECTION
-from .utils import create_neutral_result
+from .tensor_encoder import ClusterTensorEncoder, PodContext
+from .metrics_exporter import record_scoring_request, run_http_server, set_model_ready
 
 
 # Default UDS path
@@ -45,210 +52,301 @@ DEFAULT_UDS_PATH = "/var/run/kubeattention/brain.sock"
 DEV_UDS_PATH = "/tmp/kubeattention-brain.sock"
 
 
+class RequestValidationError(ValueError):
+    def __init__(self, code: grpc.StatusCode, detail: str):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
 class BrainServicer:
-    """
-    Implements the Brain gRPC service.
-    
-    Handles Score, BatchScore, and HealthCheck RPCs.
-    
-    Safety Features:
-    - Rejects requests with stale telemetry (configured via TELEMETRY.MAX_STALENESS_MS)
-    - Returns neutral score on NaN/Inf input
-    """
-    
+    """Validated, fail-safe implementation of the Brain RPC boundary."""
+
     def __init__(
         self,
         model: Optional[BaseScorer] = None,
         encoder: Optional[ClusterTensorEncoder] = None,
         model_version: str = "v0.2.0",
-        model_path: Optional[str] = "/app/brain/models/trained_model.pt",
+        model_path: Optional[str] = None,
     ):
         self.model = model or get_model(MODEL_SELECTION.MODEL_TYPE)
-        
-        # Load trained model if available (Issue 4 fix)
-        if model_path and os.path.exists(model_path):
-            try:
-                self.model.load(model_path)
-                print(f"Brain: Successfully loaded model from {model_path}")
-            except Exception as e:
-                print(f"Brain: Failed to load model from {model_path}: {e}")
-        else:
-            print(f"Brain: No model found at {model_path}, using random initialization")
-            
         self.encoder = encoder or ClusterTensorEncoder()
         self.model_version = model_version
+        self.model_load_error: Optional[str] = None
         self.last_latency_ms = 0
         self._request_count = 0
-        
-        # Cache for proactive rebalancing (Phase 4)
-        # node_name -> NodeMetricsSnapshot
-        self.last_telemetry_cache = {}
-    
-    async def Score(self, request, context):
-        """Handle single node score request."""
-        start_time = time.perf_counter()
-        
-        try:
-            # SAFETY: Check for stale telemetry data
-            if hasattr(request, 'node_telemetry') and request.node_telemetry.timestamp_unix_ms > 0:
-                current_time_ms = int(time.time() * 1000)
-                telemetry_age_ms = current_time_ms - request.node_telemetry.timestamp_unix_ms
-                
-                if telemetry_age_ms > TELEMETRY.MAX_STALENESS_MS:
-                    context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                    context.set_details(f"Telemetry data is {telemetry_age_ms}ms old (max: {TELEMETRY.MAX_STALENESS_MS}ms)")
-                    return scheduler_pb2.ScoreResponse(
-                        score=INFERENCE.FALLBACK_SCORE,
-                        reasoning=f"STALE DATA: Telemetry {telemetry_age_ms}ms old, using neutral score",
-                        confidence=INFERENCE.FALLBACK_CONFIDENCE,
+        self.last_telemetry_cache: dict[str, NodeMetricsSnapshot] = {}
+
+        if model_path:
+            if not os.path.isfile(model_path):
+                self.model_load_error = f"model checkpoint not found: {model_path}"
+            else:
+                try:
+                    self.model.load(model_path)
+                except Exception as error:
+                    self.model_load_error = f"incompatible model checkpoint: {error}"
+        elif not self.model.ready:
+            self.model_load_error = "no compatible model checkpoint loaded"
+        set_model_ready(self.ready)
+
+    @property
+    def ready(self) -> bool:
+        return self.model.ready and self.model_load_error is None
+
+    @staticmethod
+    def _criticality_name(value: int) -> str:
+        names = ("unknown", "low", "medium", "high")
+        if value < 0 or value >= len(names):
+            raise RequestValidationError(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"pod criticality {value} is invalid",
+            )
+        return names[value]
+
+    @staticmethod
+    def _validate_pod(request) -> PodContext:
+        if not request.HasField("pod_requirements"):
+            raise RequestValidationError(
+                grpc.StatusCode.INVALID_ARGUMENT, "pod_requirements is required"
+            )
+        pod = request.pod_requirements
+        if not pod.pod_name or not pod.pod_namespace:
+            raise RequestValidationError(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "pod name and namespace are required",
+            )
+        if pod.cpu_milli < 0 or pod.memory_bytes < 0:
+            raise RequestValidationError(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "pod CPU and memory requirements must be non-negative",
+            )
+        return PodContext(
+            pod_name=pod.pod_name,
+            pod_namespace=pod.pod_namespace,
+            cpu_milli=pod.cpu_milli,
+            memory_bytes=pod.memory_bytes,
+            priority=pod.priority,
+            workload_type=pod.workload_type or "unknown",
+            criticality=BrainServicer._criticality_name(pod.criticality),
+            labels=dict(pod.labels),
+        )
+
+    @staticmethod
+    def _validate_nodes(nodes) -> tuple[list[NodeMetricsSnapshot], Optional[str]]:
+        if not nodes:
+            raise RequestValidationError(
+                grpc.StatusCode.INVALID_ARGUMENT, "at least one candidate node is required"
+            )
+
+        now_ms = int(time.time() * 1000)
+        names: set[str] = set()
+        snapshots: list[NodeMetricsSnapshot] = []
+        degraded_reasons: list[str] = []
+        known_metrics = {
+            spec.proto_metric for spec in NODE_FEATURE_SCHEMA if spec.proto_metric is not None
+        }
+        for telemetry in nodes:
+            if not telemetry.node_name:
+                raise RequestValidationError(
+                    grpc.StatusCode.INVALID_ARGUMENT, "candidate node name is required"
+                )
+            if telemetry.node_name in names:
+                raise RequestValidationError(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"duplicate candidate node {telemetry.node_name!r}",
+                )
+            names.add(telemetry.node_name)
+            if telemetry.schema_version != FEATURE_SCHEMA_VERSION:
+                raise RequestValidationError(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"node {telemetry.node_name!r} uses schema "
+                    f"{telemetry.schema_version!r}, expected {FEATURE_SCHEMA_VERSION!r}",
+                )
+            if telemetry.timestamp_unix_ms <= 0:
+                raise RequestValidationError(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"node {telemetry.node_name!r} has no observation timestamp",
+                )
+            if telemetry.timestamp_unix_ms > now_ms:
+                raise RequestValidationError(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"node {telemetry.node_name!r} has a future observation timestamp",
+                )
+            if telemetry.observation_window_ms < 0:
+                raise RequestValidationError(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"node {telemetry.node_name!r} has a negative observation window",
+                )
+
+            available = list(telemetry.available_metrics)
+            if len(available) != len(set(available)) or any(
+                metric not in known_metrics for metric in available
+            ):
+                raise RequestValidationError(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"node {telemetry.node_name!r} has invalid metric availability",
+                )
+
+            snapshot = NodeMetricsSnapshot.from_proto(telemetry)
+            for spec in NODE_FEATURE_SCHEMA:
+                value = float(getattr(snapshot, spec.name))
+                if not math.isfinite(value):
+                    raise RequestValidationError(
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        f"node {telemetry.node_name!r} field {spec.name} must be finite",
                     )
-            
-            # Unified feature extraction using snapshots (handles normalization)
-            if hasattr(request, 'node_telemetry') and request.node_telemetry.node_name:
-                snapshot = NodeMetricsSnapshot.from_proto(request.node_telemetry)
-            else:
-                # Fallback for legacy requests
-                snapshot = NodeMetricsSnapshot(
-                    node_name=request.node_name or "unknown",
-                    cpu_utilization=request.telemetry.get("cpu_utilization", 0.5),
-                    memory_utilization=request.telemetry.get("memory_utilization", 0.5),
+                if value < spec.minimum or value > spec.maximum:
+                    raise RequestValidationError(
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        f"node {telemetry.node_name!r} field {spec.name} is out of range",
+                    )
+
+            age_ms = now_ms - telemetry.timestamp_unix_ms
+            if age_ms > TELEMETRY.MAX_STALENESS_MS:
+                degraded_reasons.append(
+                    f"node {telemetry.node_name!r} telemetry is {age_ms}ms old"
                 )
-            
-            node_features = np.array([snapshot.to_feature_vector()], dtype=np.float32)
-            
-            # Unified pod feature extraction
-            if hasattr(request, 'pod_requirements'):
-                pod = PodContext(
-                    pod_name=request.pod_requirements.pod_name,
-                    pod_namespace=request.pod_requirements.pod_namespace,
-                    cpu_milli=request.pod_requirements.cpu_milli,
-                    memory_bytes=request.pod_requirements.memory_bytes,
-                    workload_type=request.pod_requirements.workload_type or "unknown",
-                    criticality="unknown", # Default
+            missing = REQUIRED_PROTO_METRICS - snapshot.available_metrics
+            if missing:
+                degraded_reasons.append(
+                    f"node {telemetry.node_name!r} is missing required metrics "
+                    f"{sorted(missing)}"
                 )
-            else:
-                pod = PodContext(pod_name="unknown", pod_namespace="unknown", cpu_milli=1000, memory_bytes=1024**3)
-                
-            pod_features = np.array(pod.to_feature_vector(), dtype=np.float32)
-            
-            # Run model inference using new score_nodes interface
-            results = self.model.score_nodes(node_features, pod_features, [snapshot.node_name])
-            result = results[0]
-            
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self.last_latency_ms = int(elapsed_ms)
-            
-            # Update cache for proactive rebalancing
+            snapshots.append(snapshot)
+
+        degradation = "; ".join(degraded_reasons) if degraded_reasons else None
+        return snapshots, degradation
+
+    @staticmethod
+    def _neutral_scores(nodes, reason: str):
+        return [
+            scheduler_pb2.NodeScore(
+                node_name=node.node_name,
+                score=INFERENCE.FALLBACK_SCORE,
+                reasoning=reason,
+            )
+            for node in nodes
+        ]
+
+    async def _infer(self, node_features, pod_features, node_names, context):
+        timeout_seconds = INFERENCE.MAX_LATENCY_MS / 1000
+        time_remaining = getattr(context, "time_remaining", None)
+        if callable(time_remaining):
+            remaining = time_remaining()
+            if remaining is not None:
+                timeout_seconds = min(timeout_seconds, max(0.0, remaining))
+        if timeout_seconds <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                self.model.score_nodes, node_features, pod_features, node_names
+            ),
+            timeout=timeout_seconds,
+        )
+
+    async def Score(self, request, context):
+        """Use the same validated batch path for a single candidate."""
+        batch_request = scheduler_pb2.BatchScoreRequest(
+            pod_requirements=request.pod_requirements,
+            nodes=[request.node_telemetry],
+        )
+        response = await self.BatchScore(batch_request, context)
+        if not response.scores:
+            return scheduler_pb2.ScoreResponse()
+        result = response.scores[0]
+        return scheduler_pb2.ScoreResponse(
+            score=result.score,
+            reasoning=result.reasoning,
+        )
+
+    def _finish_batch(self, start_time, result: str, scores=None):
+        response_scores = list(scores or [])
+        latency_seconds = time.perf_counter() - start_time
+        self.last_latency_ms = int(latency_seconds * 1000)
+        record_scoring_request(result, latency_seconds, response_scores)
+        return scheduler_pb2.BatchScoreResponse(scores=response_scores)
+
+    async def BatchScore(self, request, context):
+        start_time = time.perf_counter()
+        self._request_count += 1
+        try:
+            pod = self._validate_pod(request)
+            snapshots, degradation = self._validate_nodes(request.nodes)
+        except RequestValidationError as error:
+            context.set_code(error.code)
+            context.set_details(error.detail)
+            return self._finish_batch(start_time, "invalid_request")
+
+        if degradation:
+            return self._finish_batch(
+                start_time,
+                "degraded_telemetry",
+                self._neutral_scores(
+                    request.nodes, f"telemetry unavailable: {degradation}"
+                ),
+            )
+        if not self.ready:
+            return self._finish_batch(
+                start_time,
+                "model_unavailable",
+                self._neutral_scores(
+                    request.nodes, f"model unavailable: {self.model_load_error}"
+                ),
+            )
+
+        node_features = np.asarray(
+            [snapshot.to_feature_vector() for snapshot in snapshots],
+            dtype=np.float32,
+        )
+        pod_features = np.asarray(pod.to_feature_vector(), dtype=np.float32)
+        node_names = [snapshot.node_name for snapshot in snapshots]
+        try:
+            results = await self._infer(
+                node_features, pod_features, node_names, context
+            )
+        except asyncio.TimeoutError:
+            return self._finish_batch(
+                start_time,
+                "deadline_exceeded",
+                self._neutral_scores(
+                    request.nodes, "inference deadline exceeded; using neutral score"
+                ),
+            )
+        except Exception as error:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"model inference failed: {error}")
+            return self._finish_batch(start_time, "inference_error")
+
+        if (
+            len(results) != len(node_names)
+            or [result.node_name for result in results] != node_names
+        ):
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details("model returned an invalid candidate set")
+            return self._finish_batch(start_time, "invalid_model_output")
+        if any(result.score < 0 or result.score > 100 for result in results):
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details("model returned an out-of-range score")
+            return self._finish_batch(start_time, "invalid_model_output")
+
+        for snapshot in snapshots:
             self.last_telemetry_cache[snapshot.node_name] = snapshot
-            
-            return scheduler_pb2.ScoreResponse(
+        scores = [
+            scheduler_pb2.NodeScore(
+                node_name=result.node_name,
                 score=result.score,
                 reasoning=result.reasoning,
-                confidence=result.confidence,
             )
-            
-        except Exception as e:
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return scheduler_pb2.ScoreResponse(score=50, reasoning=f"Error: {e}")
+            for result in results
+        ]
+        return self._finish_batch(start_time, "success", scores)
 
-    
-    async def BatchScore(self, request, context):
-        """Handle batch scoring for multiple nodes."""
-        start_time = time.perf_counter()
-        
-        try:
-            from .metrics_schema import FEATURE_NAMES
-            import numpy as np
-            
-            # SAFETY: Check for stale telemetry (Issue 3 fix)
-            current_time_ms = int(time.time() * 1000)
-            stale_nodes = []
-            for node in request.nodes:
-                if node.timestamp_unix_ms > 0:
-                    telemetry_age_ms = current_time_ms - node.timestamp_unix_ms
-                    if telemetry_age_ms > TELEMETRY.MAX_STALENESS_MS:
-                        stale_nodes.append(node.node_name)
-            
-            if stale_nodes:
-                # Return neutral scores for all nodes if any are stale
-                scores = [
-                    scheduler_pb2.NodeScore(
-                        node_name=node.node_name,
-                        score=INFERENCE.FALLBACK_SCORE,
-                        reasoning="STALE DATA: Telemetry too old, using neutral score",
-                        confidence=INFERENCE.FALLBACK_CONFIDENCE,
-                    )
-                    for node in request.nodes
-                ]
-                return scheduler_pb2.BatchScoreResponse(scores=scores)
-            
-            # Convert all node telemetry to snapshots and feature arrays
-            node_features_list = []
-            node_names = []
-            for node in request.nodes:
-                snap = NodeMetricsSnapshot.from_proto(node)
-                # Update cache for proactive rebalancing
-                self.last_telemetry_cache[node.node_name] = snap
-                node_names.append(node.node_name)
-                node_features_list.append(snap.to_feature_vector())
-            
-            node_features = np.array(node_features_list, dtype=np.float32)
-            
-            # Build pod context using shared logic
-            pod = PodContext(
-                pod_name=request.pod_requirements.pod_name,
-                pod_namespace=request.pod_requirements.pod_namespace,
-                cpu_milli=request.pod_requirements.cpu_milli,
-                memory_bytes=request.pod_requirements.memory_bytes,
-                workload_type=request.pod_requirements.workload_type or "unknown",
-                criticality="unknown",
-            )
-            pod_features = np.array(pod.to_feature_vector(), dtype=np.float32)
-            
-            # Run model inference using new score_nodes interface
-            results = self.model.score_nodes(node_features, pod_features, node_names)
-            
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self.last_latency_ms = int(elapsed_ms)
-            
-            # Check for timeout
-            if elapsed_ms > INFERENCE.MAX_LATENCY_MS:
-                scores = [
-                    scheduler_pb2.NodeScore(
-                        node_name=node.node_name,
-                        score=INFERENCE.FALLBACK_SCORE,
-                        reasoning=f"TIMEOUT: Inference exceeded {INFERENCE.MAX_LATENCY_MS}ms, using neutral score",
-                        confidence=INFERENCE.FALLBACK_CONFIDENCE,
-                    )
-                    for node in request.nodes
-                ]
-                return scheduler_pb2.BatchScoreResponse(scores=scores)
-            
-            scores = [
-                scheduler_pb2.NodeScore(
-                    node_name=r.node_name,
-                    score=r.score,
-                    reasoning=r.reasoning,
-                    confidence=r.confidence,
-                )
-                for r in results
-            ]
-            
-            return scheduler_pb2.BatchScoreResponse(scores=scores)
-            
-        except Exception as e:
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return scheduler_pb2.BatchScoreResponse(scores=[])
-
-    
     async def HealthCheck(self, request, context):
-        """Health check for circuit breaker."""
         return scheduler_pb2.HealthCheckResponse(
-            healthy=True,
+            healthy=self.ready,
             latency_ms=self.last_latency_ms,
             model_version=self.model_version,
+            model_schema_version=FEATURE_SCHEMA_VERSION if self.ready else "",
         )
 
 
@@ -256,16 +354,18 @@ class BrainServer:
     """
     Async gRPC server that listens on Unix Domain Socket.
     """
-    
     def __init__(
         self,
         uds_path: str = DEV_UDS_PATH,
         max_workers: int = 4,
         model: Optional[BaseScorer] = None,
+        model_path: Optional[str] = None,
     ):
         self.uds_path = uds_path
         self.max_workers = max_workers
-        self.servicer = BrainServicer(model=model)
+        if model_path is None and model is None:
+            model_path = os.environ.get("MODEL_PATH", "/models/best_model.pt")
+        self.servicer = BrainServicer(model=model, model_path=model_path)
         self.server: Optional[aio.Server] = None
         
         # Initialize Rebalancer (Phase 4)
@@ -316,6 +416,9 @@ class BrainServer:
         print(f"Brain server starting on unix://{self.uds_path} and TCP port {tcp_port}")
         await self.server.start()
         print(f"Brain server ready!")
+        metrics_port = os.environ.get("METRICS_PORT")
+        if metrics_port:
+            run_http_server(int(metrics_port))
     
     async def stop(self):
         """Stop the server gracefully."""

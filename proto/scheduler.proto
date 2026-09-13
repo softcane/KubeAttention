@@ -16,6 +16,22 @@ service Brain {
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse) {}
 }
 
+// NodeMetric identifies which measurements were actually observed.
+enum NodeMetric {
+  NODE_METRIC_UNSPECIFIED = 0;
+  NODE_METRIC_CPU_UTILIZATION = 1;
+  NODE_METRIC_CPU_THROTTLE_RATE = 2;
+  NODE_METRIC_MEMORY_UTILIZATION = 3;
+  NODE_METRIC_MEMORY_BANDWIDTH = 4;
+  NODE_METRIC_L3_CACHE_MISS_RATE = 5;
+  NODE_METRIC_L3_CACHE_OCCUPANCY = 6;
+  NODE_METRIC_DISK_IO_WAIT = 7;
+  NODE_METRIC_DISK_IOPS = 8;
+  NODE_METRIC_NETWORK_RX_PACKETS = 9;
+  NODE_METRIC_NETWORK_TX_PACKETS = 10;
+  NODE_METRIC_NETWORK_DROP_RATE = 11;
+}
+
 // NodeTelemetry contains eBPF-collected metrics from Tetragon
 message NodeTelemetry {
   string node_name = 1;
@@ -52,7 +68,15 @@ message NodeTelemetry {
   string availability_zone = 16;        // e.g., "us-east-1a"
   string rack_id = 17;                  // Rack-level failure domain
   double spot_interruption_risk = 18;   // 0.0-1.0 (from AWS/GCP API)
+  // Measurement provenance and availability. Zero values are not treated as observations
+  // unless the corresponding metric appears in available_metrics.
+  repeated NodeMetric available_metrics = 19;
+  string telemetry_source = 20;
+  string degradation_reason = 21;
+  int64 observation_window_ms = 22;
+  string schema_version = 23;
 }
+
 
 // Criticality level for pod placement (Phase 2)
 enum Criticality {
@@ -79,6 +103,7 @@ message PodRequirements {
   
   // Criticality level (Phase 2)
   Criticality criticality = 7;          // From pod annotation kubeattention.io/criticality
+  int32 priority = 8;                    // Kubernetes scheduling priority
 }
 
 // ScoreRequest for single node evaluation
@@ -94,11 +119,9 @@ message ScoreRequest {
 }
 
 message ScoreResponse {
-  int64 score = 1;                      // 0-100, higher is better
-  
-  // Explanation for debugging/shadow mode
+  int64 score = 1;                      // Absolute quality: 0 worst, 100 best
   string reasoning = 2;                 // Human-readable explanation
-  double confidence = 3;                // Model confidence 0.0-1.0
+  reserved 3;
 }
 
 // BatchScoreRequest for evaluating multiple nodes at once
@@ -110,12 +133,11 @@ message BatchScoreRequest {
 message BatchScoreResponse {
   repeated NodeScore scores = 1;
 }
-
 message NodeScore {
   string node_name = 1;
-  int64 score = 2;
+  int64 score = 2;                      // Absolute quality: 0 worst, 100 best
   string reasoning = 3;
-  double confidence = 4;
+  reserved 4;
 }
 
 // HealthCheck for circuit breaker pattern
@@ -125,4 +147,5 @@ message HealthCheckResponse {
   bool healthy = 1;
   int64 latency_ms = 2;                 // Last inference latency
   string model_version = 3;
+  string model_schema_version = 4;
 }

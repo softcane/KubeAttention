@@ -1,268 +1,135 @@
-"""
-eBPF Tetragon Metrics Schema for KubeAttention
-
-Defines the structure of metrics collected via eBPF/Tetragon probes.
-These metrics form the input features for the Transformer model.
-"""
+"""Versioned node and pod feature contract shared by training and serving."""
 
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
-import time
+import math
+from typing import Mapping
 
 
-class MetricCategory(Enum):
-    """Categories of eBPF metrics for feature grouping."""
-    CPU = "cpu"
-    MEMORY = "memory"
-    CACHE = "cache"
-    IO = "io"
-    NETWORK = "network"
+FEATURE_SCHEMA_VERSION = "node-pod-v1"
+WORKLOAD_TYPES = ("cpu-bound", "memory-bound", "io-bound", "balanced", "unknown")
+CRITICALITY_LEVELS = ("unknown", "low", "medium", "high")
+POD_FEATURE_NAMES = (
+    "cpu_normalized",
+    "memory_normalized",
+    "priority_normalized",
+    *(f"workload_{name}" for name in WORKLOAD_TYPES),
+    *(f"criticality_{name}" for name in CRITICALITY_LEVELS),
+)
 
 
-@dataclass
-class TetragonMetricSpec:
-    """Specification for a single Tetragon metric."""
+@dataclass(frozen=True)
+class FeatureSpec:
     name: str
-    category: MetricCategory
-    unit: str
-    min_value: float
-    max_value: float
-    description: str
-    ebpf_probe: str  # The eBPF probe type (kprobe, tracepoint, etc.)
+    minimum: float
+    maximum: float
+    proto_metric: int | None = None
+    required_for_active_scoring: bool = False
+
+    def normalize(self, value: float) -> float:
+        return max(0.0, min(1.0, (value - self.minimum) / (self.maximum - self.minimum)))
 
 
-# Complete eBPF metrics schema matching scheduler.proto NodeTelemetry
-TETRAGON_METRICS_SCHEMA: list[TetragonMetricSpec] = [
-    # CPU Metrics
-    TetragonMetricSpec(
-        name="cpu_utilization",
-        category=MetricCategory.CPU,
-        unit="ratio",
-        min_value=0.0,
-        max_value=1.0,
-        description="CPU utilization ratio across all cores",
-        ebpf_probe="tracepoint:sched:sched_stat_runtime",
-    ),
-    TetragonMetricSpec(
-        name="cpu_throttle_rate",
-        category=MetricCategory.CPU,
-        unit="events/sec",
-        min_value=0.0,
-        max_value=10000.0,
-        description="CPU throttling events per second",
-        ebpf_probe="tracepoint:cgroup:cgroup_throttle",
-    ),
-    
-    # Memory Metrics
-    TetragonMetricSpec(
-        name="memory_utilization",
-        category=MetricCategory.MEMORY,
-        unit="ratio",
-        min_value=0.0,
-        max_value=1.0,
-        description="Memory utilization ratio",
-        ebpf_probe="kprobe:__alloc_pages",
-    ),
-    TetragonMetricSpec(
-        name="memory_bandwidth_gbps",
-        category=MetricCategory.MEMORY,
-        unit="GB/s",
-        min_value=0.0,
-        max_value=200.0,
-        description="Memory bandwidth utilization",
-        ebpf_probe="perf:mem_load_retired.l3_miss",
-    ),
-    
-    # L3 Cache Metrics (critical for noisy neighbor detection)
-    TetragonMetricSpec(
-        name="l3_cache_miss_rate",
-        category=MetricCategory.CACHE,
-        unit="ratio",
-        min_value=0.0,
-        max_value=1.0,
-        description="L3 cache miss rate - key noisy neighbor indicator",
-        ebpf_probe="perf:cache_misses",
-    ),
-    TetragonMetricSpec(
-        name="l3_cache_occupancy_mb",
-        category=MetricCategory.CACHE,
-        unit="MB",
-        min_value=0.0,
-        max_value=256.0,
-        description="L3 cache occupancy in megabytes",
-        ebpf_probe="perf:llc_occupancy",
-    ),
-    
-    # I/O Metrics
-    TetragonMetricSpec(
-        name="disk_io_wait_ms",
-        category=MetricCategory.IO,
-        unit="ms",
-        min_value=0.0,
-        max_value=1000.0,
-        description="Average disk I/O wait time",
-        ebpf_probe="tracepoint:block:block_rq_complete",
-    ),
-    TetragonMetricSpec(
-        name="disk_iops",
-        category=MetricCategory.IO,
-        unit="ops/sec",
-        min_value=0.0,
-        max_value=1000000.0,
-        description="Disk I/O operations per second",
-        ebpf_probe="tracepoint:block:block_rq_issue",
-    ),
-    
-    # Network Metrics
-    TetragonMetricSpec(
-        name="network_rx_packets_sec",
-        category=MetricCategory.NETWORK,
-        unit="packets/sec",
-        min_value=0.0,
-        max_value=10000000.0,
-        description="Network receive packets per second",
-        ebpf_probe="tracepoint:net:netif_receive_skb",
-    ),
-    TetragonMetricSpec(
-        name="network_tx_packets_sec",
-        category=MetricCategory.NETWORK,
-        unit="packets/sec",
-        min_value=0.0,
-        max_value=10000000.0,
-        description="Network transmit packets per second",
-        ebpf_probe="tracepoint:net:net_dev_xmit",
-    ),
-    TetragonMetricSpec(
-        name="network_drop_rate",
-        category=MetricCategory.NETWORK,
-        unit="ratio",
-        min_value=0.0,
-        max_value=1.0,
-        description="Network packet drop rate",
-        ebpf_probe="tracepoint:skb:kfree_skb",
-    ),
-    
-    # Meta Metrics (Phase 2 & 4)
-    TetragonMetricSpec(
-        name="node_cost_index",
-        category=MetricCategory.NETWORK,  # Reusing category or adding META
-        unit="index",
-        min_value=0.0,
-        max_value=1.0,
-        description="Relative cost index of the instance type",
-        ebpf_probe="static:node_labels",
-    ),
-    TetragonMetricSpec(
-        name="zone_diversity_score",
-        category=MetricCategory.NETWORK,
-        unit="index",
-        min_value=0.0,
-        max_value=1.0,
-        description="Zone diversity score for resilience",
-        ebpf_probe="static:topology",
-    ),
-    TetragonMetricSpec(
-        name="spot_interruption_risk",
-        category=MetricCategory.NETWORK,
-        unit="index",
-        min_value=0.0,
-        max_value=1.0,
-        description="Risk of spot interruption",
-        ebpf_probe="static:node_labels",
-    ),
-    TetragonMetricSpec(
-        name="is_spot_instance",
-        category=MetricCategory.NETWORK,
-        unit="bool",
-        min_value=0.0,
-        max_value=1.0,
-        description="Boolean for Spot/Preemptible status",
-        ebpf_probe="static:node_labels",
-    ),
-]
+NODE_FEATURE_SCHEMA = (
+    FeatureSpec("cpu_utilization", 0.0, 1.0, 1, True),
+    FeatureSpec("cpu_throttle_rate", 0.0, 10_000.0, 2),
+    FeatureSpec("memory_utilization", 0.0, 1.0, 3, True),
+    FeatureSpec("memory_bandwidth_gbps", 0.0, 200.0, 4),
+    FeatureSpec("l3_cache_miss_rate", 0.0, 1.0, 5),
+    FeatureSpec("l3_cache_occupancy_mb", 0.0, 256.0, 6),
+    FeatureSpec("disk_io_wait_ms", 0.0, 1_000.0, 7),
+    FeatureSpec("disk_iops", 0.0, 1_000_000.0, 8),
+    FeatureSpec("network_rx_packets_sec", 0.0, 10_000_000.0, 9),
+    FeatureSpec("network_tx_packets_sec", 0.0, 10_000_000.0, 10),
+    FeatureSpec("network_drop_rate", 0.0, 1.0, 11),
+    FeatureSpec("cost_per_hour", 0.0, 5.0),
+    FeatureSpec("zone_diversity_score", 0.0, 1.0),
+    FeatureSpec("spot_interruption_risk", 0.0, 1.0),
+    FeatureSpec("is_spot_instance", 0.0, 1.0),
+)
+FEATURE_NAMES = tuple(spec.name for spec in NODE_FEATURE_SCHEMA)
+FEATURE_DIM = len(FEATURE_NAMES)
+MODEL_INPUT_NAMES = FEATURE_NAMES + POD_FEATURE_NAMES
+MODEL_INPUT_DIM = len(MODEL_INPUT_NAMES)
+REQUIRED_PROTO_METRICS = frozenset(
+    spec.proto_metric for spec in NODE_FEATURE_SCHEMA if spec.required_for_active_scoring
+)
+REQUIRED_FEATURE_NAMES = frozenset(
+    spec.name for spec in NODE_FEATURE_SCHEMA if spec.required_for_active_scoring
+)
+
+
+def normalize_node_record(record: Mapping[str, object]) -> list[float]:
+    """Encode one training record with the serving normalization contract."""
+    values = []
+    for spec in NODE_FEATURE_SCHEMA:
+        raw = record.get(spec.name, 0.0)
+        if spec.name == "is_spot_instance":
+            raw = 1.0 if bool(raw) else 0.0
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError(f"{spec.name} must be finite")
+        values.append(spec.normalize(value))
+    return values
 
 
 @dataclass
 class NodeMetricsSnapshot:
-    """A point-in-time snapshot of all metrics for a node."""
+    """One node sample decoded according to FEATURE_SCHEMA_VERSION."""
+
     node_name: str
-    timestamp_ms: int = field(default_factory=lambda: int(time.time() * 1000))
-    
-    # CPU
+    timestamp_ms: int = 0
+    available_metrics: frozenset[int] = field(default_factory=frozenset)
+    telemetry_source: str = ""
+    degradation_reason: str = ""
+    observation_window_ms: int = 0
+    schema_version: str = FEATURE_SCHEMA_VERSION
+
     cpu_utilization: float = 0.0
     cpu_throttle_rate: float = 0.0
-    
-    # Memory
     memory_utilization: float = 0.0
     memory_bandwidth_gbps: float = 0.0
-    
-    # Cache
     l3_cache_miss_rate: float = 0.0
     l3_cache_occupancy_mb: float = 0.0
-    
-    # I/O
     disk_io_wait_ms: float = 0.0
     disk_iops: float = 0.0
-    
-    # Network
     network_rx_packets_sec: float = 0.0
     network_tx_packets_sec: float = 0.0
     network_drop_rate: float = 0.0
-    
-    # Cost (Phase 2)
-    node_cost_index: float = 0.0
+    cost_per_hour: float = 0.0
     is_spot_instance: bool = False
-    
-    # Resilience (Phase 4)
-    availability_zone: str = "unknown"
+    availability_zone: str = ""
     zone_diversity_score: float = 0.5
     spot_interruption_risk: float = 0.0
-    
+
     def to_feature_vector(self) -> list[float]:
-        """Convert to normalized feature vector for model input."""
-        features = []
-        for spec in TETRAGON_METRICS_SCHEMA:
-            if spec.name == "is_spot_instance":
-                features.append(1.0 if self.is_spot_instance else 0.0)
-                continue
-                
-            value = getattr(self, spec.name)
-            if isinstance(value, str):
-                # Strings (like zone) are handled via zone_diversity_score helper
-                continue
-                
-            # Normalize to [0, 1] range
-            normalized = (value - spec.min_value) / (spec.max_value - spec.min_value + 1e-8)
-            features.append(max(0.0, min(1.0, normalized)))
-        return features
-    
+        return normalize_node_record(self.__dict__)
+
+    def missing_required_metrics(self) -> frozenset[int]:
+        return REQUIRED_PROTO_METRICS - self.available_metrics
+
     @classmethod
-    def from_proto(cls, proto_telemetry) -> "NodeMetricsSnapshot":
-        """Create from protobuf NodeTelemetry message."""
+    def from_proto(cls, telemetry) -> "NodeMetricsSnapshot":
         return cls(
-            node_name=proto_telemetry.node_name,
-            timestamp_ms=proto_telemetry.timestamp_unix_ms,
-            cpu_utilization=proto_telemetry.cpu_utilization,
-            cpu_throttle_rate=proto_telemetry.cpu_throttle_rate,
-            memory_utilization=proto_telemetry.memory_utilization,
-            memory_bandwidth_gbps=proto_telemetry.memory_bandwidth_gbps,
-            l3_cache_miss_rate=proto_telemetry.l3_cache_miss_rate,
-            l3_cache_occupancy_mb=proto_telemetry.l3_cache_occupancy_mb,
-            disk_io_wait_ms=proto_telemetry.disk_io_wait_ms,
-            disk_iops=proto_telemetry.disk_iops,
-            network_rx_packets_sec=proto_telemetry.network_rx_packets_sec,
-            network_tx_packets_sec=proto_telemetry.network_tx_packets_sec,
-            network_drop_rate=proto_telemetry.network_drop_rate,
-            node_cost_index=getattr(proto_telemetry, "cost_per_hour", 0.0),
-            is_spot_instance=getattr(proto_telemetry, "is_spot_instance", False),
-            availability_zone=getattr(proto_telemetry, "availability_zone", "unknown"),
-            spot_interruption_risk=getattr(proto_telemetry, "spot_interruption_risk", 0.0),
+            node_name=telemetry.node_name,
+            timestamp_ms=telemetry.timestamp_unix_ms,
+            available_metrics=frozenset(telemetry.available_metrics),
+            telemetry_source=telemetry.telemetry_source,
+            degradation_reason=telemetry.degradation_reason,
+            observation_window_ms=telemetry.observation_window_ms,
+            schema_version=telemetry.schema_version,
+            cpu_utilization=telemetry.cpu_utilization,
+            cpu_throttle_rate=telemetry.cpu_throttle_rate,
+            memory_utilization=telemetry.memory_utilization,
+            memory_bandwidth_gbps=telemetry.memory_bandwidth_gbps,
+            l3_cache_miss_rate=telemetry.l3_cache_miss_rate,
+            l3_cache_occupancy_mb=telemetry.l3_cache_occupancy_mb,
+            disk_io_wait_ms=telemetry.disk_io_wait_ms,
+            disk_iops=telemetry.disk_iops,
+            network_rx_packets_sec=telemetry.network_rx_packets_sec,
+            network_tx_packets_sec=telemetry.network_tx_packets_sec,
+            network_drop_rate=telemetry.network_drop_rate,
+            cost_per_hour=telemetry.cost_per_hour,
+            is_spot_instance=telemetry.is_spot_instance,
+            availability_zone=telemetry.availability_zone,
+            spot_interruption_risk=telemetry.spot_interruption_risk,
         )
-
-
-# Feature dimension (number of metrics)
-FEATURE_DIM = len(TETRAGON_METRICS_SCHEMA)
-
-# Feature names for interpretability
-FEATURE_NAMES = [spec.name for spec in TETRAGON_METRICS_SCHEMA]

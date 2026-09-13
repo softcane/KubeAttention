@@ -5,12 +5,14 @@ Gradient boosted trees for node ranking.
 <1ms inference, excellent for tabular data.
 """
 
+import json
 import os
 from typing import List, Dict, Any, Optional
 import numpy as np
 
 from .base import BaseScorer, ScoringResult, generate_reasoning
 from . import register_model
+from brain.metrics_schema import FEATURE_SCHEMA_VERSION, MODEL_INPUT_DIM, MODEL_INPUT_NAMES
 
 try:
     import xgboost as xgb
@@ -65,6 +67,21 @@ class XGBoostScorer(BaseScorer):
         if self.model is None:
             return 0
         return self.n_estimators * (2 ** self.max_depth)
+
+    @property
+    def ready(self) -> bool:
+        return self._is_trained
+
+    def predict_quality(self, features: np.ndarray) -> np.ndarray:
+        if not self._is_trained or self.model is None:
+            raise ValueError("model is not trained")
+        if features.ndim != 2 or features.shape[1] != MODEL_INPUT_DIM:
+            raise ValueError(f"features must have shape (N, {MODEL_INPUT_DIM})")
+        return np.clip(
+            np.asarray(self.model.predict(features), dtype=np.float64),
+            0.0,
+            1.0,
+        )
     
     def score_nodes(
         self,
@@ -72,60 +89,30 @@ class XGBoostScorer(BaseScorer):
         pod_features: np.ndarray,
         node_names: List[str],
     ) -> List[ScoringResult]:
-        """Score all candidate nodes."""
+        """Return absolute node-quality scores using the loaded model."""
         if not self._is_trained:
-            # Return neutral scores if not trained
             return [
-                ScoringResult(
-                    node_name=name,
-                    score=50,
-                    confidence=0.5,
-                    reasoning=f"Model not trained, using neutral score for {name}",
-                )
+                ScoringResult(name, 50, f"Model not trained, using neutral score for {name}")
                 for name in node_names
             ]
-        
-        # Concatenate node features with pod context (broadcast pod to all nodes)
-        N = node_features.shape[0]
-        if pod_features is not None and len(pod_features) > 0:
-            if len(pod_features.shape) == 1:
-                pod_broadcast = np.tile(pod_features, (N, 1))
-            else:
-                pod_broadcast = pod_features
-            X_combined = np.hstack([node_features, pod_broadcast])
-        else:
-            X_combined = node_features
-        
-        # Predict raw scores (can be any range)
-        raw_scores = self.model.predict(X_combined)
-        
-        # Min-max normalization to [0, 100]
-        # This handles cases where XGBoost outputs negative or >1 values
-        score_min = raw_scores.min()
-        score_max = raw_scores.max()
-        if score_max - score_min > 1e-8:
-            scores = (raw_scores - score_min) / (score_max - score_min) * 100
-        else:
-            # All same score - return neutral
-            scores = np.full_like(raw_scores, 50.0)
-        
-        # Confidence based on score spread (higher spread = more confident in ranking)
-        score_std = np.std(scores)
-        base_confidence = min(score_std / 30.0, 0.9)  # Confidence increases with score variance
-        confidences = np.full_like(scores, base_confidence + 0.1)
-        
-        results = []
-        for i, node_name in enumerate(node_names):
-            score = int(np.clip(scores[i], 0, 100))
-            conf = float(np.clip(confidences[i], 0.3, 0.95))
-            results.append(ScoringResult(
-                node_name=node_name,
-                score=score,
-                confidence=conf,
-                reasoning=generate_reasoning(node_name, score, node_features[i]),
-            ))
-        
-        return results
+        node_count = node_features.shape[0]
+        if pod_features is None or pod_features.ndim != 1:
+            raise ValueError("pod_features must be a one-dimensional feature vector")
+        pod_broadcast = np.broadcast_to(pod_features, (node_count, pod_features.shape[0]))
+        combined = np.hstack([node_features, pod_broadcast])
+        if combined.shape[1] != MODEL_INPUT_DIM:
+            raise ValueError(
+                f"model input has {combined.shape[1]} features, expected {MODEL_INPUT_DIM}"
+            )
+        scores = self.predict_quality(combined) * 100.0
+        return [
+            ScoringResult(
+                node_name=name,
+                score=int(scores[index]),
+                reasoning=generate_reasoning(name, int(scores[index]), node_features[index]),
+            )
+            for index, name in enumerate(node_names)
+        ]
 
 
     
@@ -168,14 +155,23 @@ class XGBoostScorer(BaseScorer):
         }
     
     def save(self, path: str) -> None:
-        """Save model to disk."""
-        if self.model is None:
+        if not self._is_trained or self.model is None:
             raise ValueError("Model not trained yet")
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.model.save_model(path)
-    
+        with open(f"{path}.metadata.json", "w") as metadata_file:
+            json.dump({
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                "model_input_names": MODEL_INPUT_NAMES,
+            }, metadata_file)
+
     def load(self, path: str) -> None:
-        """Load model from disk."""
+        with open(f"{path}.metadata.json") as metadata_file:
+            metadata = json.load(metadata_file)
+        if metadata.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
+            raise ValueError("checkpoint feature schema is incompatible")
+        if tuple(metadata.get("model_input_names", ())) != MODEL_INPUT_NAMES:
+            raise ValueError("checkpoint feature order is incompatible")
         self.model = xgb.XGBRegressor()
         self.model.load_model(path)
         self._is_trained = True
